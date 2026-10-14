@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Install Packages (pkg install)
+Comment=Pick packages from Fedora, Arch/AUR and Ubuntu and install them (fzf TUI)
+Exec=konsole --separate --workdir __HOME__ -e pkg install
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+Keywords=pkg;install;package;packages;software;dnf;yay;aur;pacman;apt;dpkg;ubuntu;fedora;arch;
+StartupNotify=false

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.1
+Name=Remove Packages (pkg remove)
+Comment=Pick packages present on Fedora or in the Arch/Ubuntu containers and remove them (fzf TUI)
+Exec=konsole --separate --workdir __HOME__ -e pkg remove
+Icon=edit-delete
+Terminal=false
+Categories=System;PackageManager;
+Keywords=pkg;remove;erase;drop;package;packages;software;dnf;yay;pacman;apt;dpkg;ubuntu;fedora;arch;
+StartupNotify=false

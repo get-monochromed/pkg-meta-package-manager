@@ -1,0 +1,7 @@
+# Nothing here is built or generated — the repo is a script, docs and launchers.
+# Only editor and OS noise is ignored.
+*~
+*.swp
+*.orig
+*.rej
+.DS_Store
