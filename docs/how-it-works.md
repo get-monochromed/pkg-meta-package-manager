@@ -99,9 +99,17 @@ package manager available here" while standing in the Arch container.
 
 `in_cont` runs a command **locally** when `$HERE` is that container, because
 distrobox cannot nest — `distrobox enter Ubuntu` from inside Ubuntu fails with
-"failed to execute process". Every preview, info, export and teardown path goes
-through `in_cont`, which is what lets `pkg add <pkg>` inside a container still export
-the binary or `.desktop` to the host, and `pkg drop` un-export it before removing it.
+"failed to execute process". That is what lets `pkg add <pkg>` inside a container
+still export the binary or `.desktop` to the host, and `pkg drop` un-export it before
+removing it.
+
+Not every container call needs `in_cont`, though. The Arch world speaks through the
+exported `pacman`/`yay` shims, whose own logic is: hop out only when `$CONTAINER_ID`
+is unset or names a *different* container, otherwise `exec` the container's real
+binary. So inside Arch those calls are already local (verified: `pacman -Q` inside
+Arch is a native exec, while the same command inside Ubuntu takes the host hop), and
+`in_cont` is used where a *specific* container must be addressed — previews, info,
+`export`/`unexport`, teardown and the Ubuntu world, which has no apt shim.
 
 `pacman`, `yay` and `apt` are also exported as shims in `~/.local/bin` so host-side
 calls work without `distrobox enter`. Both containers have passwordless sudo

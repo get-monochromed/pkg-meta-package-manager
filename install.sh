@@ -22,7 +22,7 @@ info() { printf '\033[32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-containers() { distrobox list 2>/dev/null | awk -F'|' 'NR>1 {gsub(/^ +| +$/, "", $2); print $2}'; }
+containers() { distrobox list 2>/dev/null | awk -F'|' 'NR>1 {gsub(/ /, "", $2); print $2}'; }
 in_arch()    { distrobox enter "$ARCH_CONTAINER" -- "$@"; }
 in_ubuntu()  { distrobox enter "$UBUNTU_CONTAINER" -- "$@"; }
 
@@ -92,8 +92,9 @@ export_bin "$UBUNTU_CONTAINER" /usr/bin/apt
 info "installing $BIN_DIR/pkg"
 install -Dm755 "$REPO_DIR/bin/pkg" "$BIN_DIR/pkg"
 mkdir -p "$APP_DIR"
+home_esc="$(printf '%s' "$HOME" | sed 's/[&|\\]/\\&/g')"
 for f in pkg-install.desktop pkg-remove.desktop; do
-  sed "s|__HOME__|$HOME|g" "$REPO_DIR/desktop/$f" > "$APP_DIR/$f"
+  sed "s|__HOME__|$home_esc|g" "$REPO_DIR/desktop/$f" > "$APP_DIR/$f"
   info "installed $APP_DIR/$f"
 done
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
