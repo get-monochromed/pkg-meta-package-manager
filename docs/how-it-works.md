@@ -63,28 +63,84 @@ container's `bash` can be removed if you insist.
 Use `dnf -q info` / `dnf -q search`: the non-quiet forms print "Updating and loading
 repositories: Repositories loaded" into the preview pane.
 
-## Containers
+## Containers and environment detection
 
-Two distrobox containers hold the non-Fedora worlds, named in exactly two places:
+pkg runs from three places — the Fedora host, inside the Arch container, inside the
+Ubuntu container — and it is the same file in all of them, because the containers
+share `$HOME`. Which worlds it may touch is decided once, at startup:
 
 ```bash
-CONTAINER="${PKG_CONTAINER:-Arch}"
+CONTAINER="${PKG_CONTAINER:-Arch}"           # container names live here only
 UBUNTU_CONTAINER="${PKG_UBUNTU_CONTAINER:-Ubuntu}"
-in_arch()   { distrobox enter "$CONTAINER" -- "$@"; }
-in_ubuntu() { distrobox enter "$UBUNTU_CONTAINER" -- "$@"; }
-in_cont()   { distrobox enter "$1" -- "${@:2}"; }
+HERE="${CONTAINER_ID:-}"                     # distrobox sets CONTAINER_ID
 ```
 
-`pacman`, `yay` and `apt` are also distrobox-exported shims in `~/.local/bin`, so
-host-side calls to them work without `distrobox enter`. Both containers have
-passwordless sudo (distrobox writes `/etc/sudoers.d/<user>` with `NOPASSWD:ALL` at
-creation), so container installs/removals are fully automatable — the Fedora host is
-the only world that needs a password.
+| where | Fedora | Arch | Ubuntu |
+|---|---|---|---|
+| host (`HERE` empty) | `dnf` + `rpm` present | `pacman` + `yay` shims present **and** the container is listed by `distrobox list` | the Ubuntu container is listed |
+| inside Arch | — | native `pacman` + `yay` | — |
+| inside Ubuntu | — | — | native `apt-get` + `dpkg` |
+| inside another container | native `dnf`, if any | native `pacman`/`yay`, if any | native `apt-get`/`dpkg`, if any |
+
+Downstream code never asks those questions again: it asks `has_fedora` /
+`has_arch` / `has_apt`, `w_installed <world> <pkg>` and `w_has <world> <pkg>` (both
+false for a world that is not here), and iterates `"${WORLDS[@]}"` in priority
+order. `require_worlds` fails early and clearly when nothing is available at all.
+
+**Why “native” has to be proved.** Inside a container, `command -v pacman` finds the
+exported shim in `~/.local/bin`, which hops out to the host and then into the Arch
+container — from inside Ubuntu, `pacman -Q fastfetch` answers about *Arch's* copy,
+which is how `pkg add fastfetch` used to print `installed: fastfetch` while
+installing nothing. So availability is probed with `native_cmd`, which walks `PATH`
+**skipping** `$EXPORT_BIN_DIR`. That also means the probe cannot use `command -v`:
+`$HOME/.local/bin` precedes `/usr/bin` in a container's PATH, so `command -v pacman`
+inside Arch answers with the shim and the first version of this probe concluded "no
+package manager available here" while standing in the Arch container.
+
+`in_cont` runs a command **locally** when `$HERE` is that container, because
+distrobox cannot nest — `distrobox enter Ubuntu` from inside Ubuntu fails with
+"failed to execute process". Every preview, info, export and teardown path goes
+through `in_cont`, which is what lets `pkg add <pkg>` inside a container still export
+the binary or `.desktop` to the host, and `pkg drop` un-export it before removing it.
+
+`pacman`, `yay` and `apt` are also exported as shims in `~/.local/bin` so host-side
+calls work without `distrobox enter`. Both containers have passwordless sudo
+(distrobox writes `/etc/sudoers.d/<user>` with `NOPASSWD:ALL` at creation), so
+container installs/removals are fully automatable — the Fedora host is the only world
+that needs a password.
 
 Cold start is slow: a stopped container makes the first `yay`/`pacman`/`apt` call
 take seconds. The cached name lists mean only the preview and the install itself pay
-that cost. When a container is unreachable, degrade with a warning instead of
-failing the whole command.
+that cost, and the parallel refresh overlaps the cold starts rather than adding them
+up. When a container is unreachable, degrade with a warning instead of failing the
+whole command.
+
+One step is deliberately host-only: the `flatpak update` in `pkg update`. Both
+containers ship their own flatpak with their own system installation, so running it
+there would update something other than the user's desktop apps; inside a container
+`pkg update` prints `skipping Flatpaks — host-side only`.
+
+## Refreshing the lists in parallel
+
+`ensure_lists` decides per world whether its list is stale, starts one background job
+per world and `wait`s for them, so a refresh costs roughly the slowest world instead
+of the sum:
+
+| job | work | cost |
+|---|---|---|
+| Fedora | `dnf repoquery --available` on the host | ~0.6 s |
+| Arch | `pacman -Slq` then `yay -Slqa` in the same container | ~0.3 s + ~3.5 s |
+| Ubuntu | `in_ubuntu apt-cache pkgnames` | ~1.0 s incl. the entry |
+
+Measured here forcing a full rebuild (`PKG_CACHE_TTL=0`): **6.71 s serial → 4.76 s
+parallel**, and all four lists byte-identical to the serial build (`cmp`). The AUR
+listing dominates, so that is the floor. The two Arch fetches stay in one job because
+the AUR list is only meaningful diffed against a freshly fetched repo list
+(`comm -23`), and because two concurrent `distrobox enter` calls into the same
+container would race its start. Each job writes its own `.tmp` file and the parent
+validates the size afterwards, so a job that dies still produces exactly the per-world
+warning it did before (`dnf: could not refresh the Fedora list…`,
+`Arch container/yay unreachable…`, `Ubuntu container unreachable…`).
 
 ## Preview pane contract
 
@@ -164,6 +220,14 @@ removed directly.
   let the user type the password. Container sudo is passwordless and needs nothing.
 - **`rm -f ""` is safe** (exit 0, no message), which is what lets the temp-file
   cleanup in the TUIs skip existence checks.
+- **A helper whose last statement is `[[ … ]] && return 1` returns 1 on the good
+  path too.** `native_cmd` started that way and reported every world as unavailable
+  inside a container: the `[[ … ]]` was false (correctly, the path was native), so
+  the function's status came from that false test. End boolean-shaped helpers with an
+  explicit `return 0`/`return 1`.
+- **`command -v` is not an availability test inside a container**: `~/.local/bin`
+  precedes `/usr/bin`, so it answers with a distrobox shim that acts on *another*
+  container (see the detection section).
 - **`in_cont_each` payloads are single-quoted on purpose** so the *container's* bash
   expands `"$@"` (shellcheck flags these as SC2016; that is intended, there are no
   real findings).
@@ -192,6 +256,27 @@ pkg add -n cowsay cbonsai pipes.sh neovim zzz-nope
 # → dnf batch (cowsay, cbonsai), yay batch (pipes.sh), "already installed" (neovim),
 #   "not found" (zzz-nope), exit 1
 ```
+
+Container-side checks (no password needed, and each is also a regression test for
+the world detection):
+
+```bash
+for c in Ubuntu Arch; do distrobox enter "$c" -- pkg help | grep Currently; done
+distrobox enter Ubuntu -- pkg add -n fastfetch        # → apt-get install, never dnf
+distrobox enter Ubuntu -- pkg add -n cowsay-off       # apt-only: installs here
+distrobox enter Ubuntu -- pkg add -n fedora-release   # → not found + hint
+distrobox enter Ubuntu -- pkg present cowsay          # apt world predicate
+distrobox enter Arch   -- pkg add -n cowsay-off       # apt-only name → not found
+distrobox enter Arch   -- pkg list apt                # → "not available here", exit 1
+distrobox enter Ubuntu -- pkg add cbatticon           # install + export from inside
+ls -l ~/.local/bin/cbatticon                          # shim created on the host
+distrobox enter Ubuntu -- pkg drop cbatticon          # unexport + purge from inside
+```
+
+TUI inside a container: install tmux there first (`sudo apt-get install -y tmux`,
+`sudo pacman -S --needed tmux`), drive it exactly as on the host, then purge tmux.
+Expect the header to advertise only that container's prefixes, and Enter to produce a
+single command line for the local manager.
 
 TUI without side effects, driven in tmux:
 

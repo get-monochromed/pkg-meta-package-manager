@@ -12,10 +12,13 @@ One `pkg install` gives you a single fzf list of **286,256** packages across all
 three; one `pkg add cowsay cbonsai 3d-ascii-viewer` routes each name to the right
 world and installs them in one batch per world.
 
+`pkg` runs on the Fedora host *or* from inside either container, and only ever uses
+the worlds reachable from where it is running — see
+[Running inside a container](#running-inside-a-container).
+
 This is a personal tool: it is written for *this* machine (Fedora host, KDE,
 containers named `Arch` and `Ubuntu`). It is not a portable cross-distro
-abstraction and makes no attempt to be one. See
-[Reproducing on a fresh install](#reproducing-on-a-fresh-install).
+abstraction and makes no attempt to be one. See [Install](#install).
 
 ## The three worlds, in resolution order
 
@@ -39,6 +42,50 @@ After the batches run, `pkg` re-checks each requested name (`rpm -q` / `pacman -
 `dpkg-query`) and exits 1 if any is missing — installers can succeed without
 registering a package.
 
+## Running inside a container
+
+The same script is in all three places (the containers share your `$HOME`, so
+`~/.local/bin/pkg` is one file). Wherever it starts, it detects which package
+managers it can actually act with, walks them in the usual priority order and uses
+the first one that has the package:
+
+| where pkg runs | what it uses |
+|---|---|
+| Fedora host | `dnf`, then Arch/`yay`, then Ubuntu/`apt` |
+| inside the Ubuntu container | `apt` only |
+| inside the Arch container | `pacman`/`yay` only |
+
+So `pkg add fastfetch` typed inside the Ubuntu container becomes
+`apt-get install -y fastfetch` — no `sudo: 'dnf': command not found`, and no risk of
+installing into a container you are not in. Worlds that are not reachable are
+reported instead of attempted, and a name only another world has fails honestly:
+
+```console
+$ pkg add cowsay-off            # apt-only name, typed inside the Arch container
+error: not found in Arch/AUR (yay): cowsay-off
+error: hint: inside the Arch container, so only Arch/AUR (yay) is reachable — run
+       pkg on the Fedora host for the other worlds
+```
+
+`pkg help` prints the detection for the shell you are in:
+
+```console
+$ pkg help | grep Currently
+  Currently: inside the Ubuntu container — available here: Ubuntu (apt)
+```
+
+Two details worth knowing:
+
+- The shims exported to `~/.local/bin` are how the *host* reaches the containers, so
+  they are deliberately not trusted as local tooling: inside the Ubuntu container
+  `pacman` is a shim that hops out to the host and into Arch (there,
+  `pacman -Q fastfetch` answers about *Arch's* copy). pkg skips them when deciding
+  what is available here.
+- Exports still work from inside a container: install something in the Ubuntu
+  container and its binary or `.desktop` is still forwarded to the host, so it shows
+  up in your menu and `PATH` outside the container as usual. `pkg drop` tears the
+  export down first, same as on the host.
+
 ## Verbs
 
 Interactive (needs `fzf`):
@@ -56,6 +103,8 @@ pkg drop [-n] <pkgs...>      remove what is installed, ignore the rest
 pkg search <term>...         dnf search + yay -Ss + apt-cache search
 pkg info [-a] <pkg>...       dnf info, else pacman -Sii, else yay -Siia, else apt-cache show
 pkg update                   dnf upgrade --refresh + yay -Syu + apt update/upgrade + flatpak update
+                             (worlds that are not reachable, and the Flatpak step
+                             inside a container, are skipped with a note)
 pkg autoremove               dnf autoremove + yay -Yc + apt autoremove --purge
 pkg clean                    dnf clean all + yay -Scc + apt clean
 pkg present <pkgs...>        exit 0 if all are installed   (predicate)
@@ -120,6 +169,11 @@ pkg list installed --json | jq -c 'select(.source=="apt")' | head
 
 Lists live in `~/.cache/pkg` (`PKG_CACHE_TTL`, default 24 h); the first build takes
 ~4 s, afterwards they load instantly. `pkg refresh` when metadata moved.
+
+The refresh fetches every world **in parallel** — one job per world, so a rebuild
+costs the slowest world (the ~3.5 s AUR listing) instead of the sum of all of them
+plus a container cold start each. Measured with `PKG_CACHE_TTL=0`: 6.7 s before,
+4.8 s now, with identical lists.
 
 ## Install
 

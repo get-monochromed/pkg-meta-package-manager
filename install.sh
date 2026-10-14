@@ -54,8 +54,8 @@ for c in "$ARCH_CONTAINER" "$UBUNTU_CONTAINER"; do
 done
 
 # ── 3. Arch container: AUR toolchain + yay ───────────────────────────────────
-info "$ARCH_CONTAINER: ensuring base-devel, git and yay"
-in_arch sudo pacman -S --needed --noconfirm base-devel git
+info "$ARCH_CONTAINER: ensuring base-devel, git, fzf and yay"
+in_arch sudo pacman -S --needed --noconfirm base-devel git fzf
 if in_arch bash -c '[ -x /usr/bin/yay ]'; then
   info "$ARCH_CONTAINER: yay already installed"
 else
@@ -63,9 +63,11 @@ else
   in_arch bash -c 'set -e; d="$(mktemp -d)"; git clone -q https://aur.archlinux.org/yay-bin.git "$d"; cd "$d"; makepkg -si --noconfirm'
 fi
 
-# ── 4. Ubuntu container: fresh apt index ─────────────────────────────────────
-info "$UBUNTU_CONTAINER: apt-get update"
+# ── 4. Ubuntu container: apt index + fzf ─────────────────────────────────────
+# fzf is needed *inside* the containers too: pkg's TUIs run there now.
+info "$UBUNTU_CONTAINER: apt-get update, then fzf"
 in_ubuntu sudo apt-get update
+in_ubuntu sudo apt-get install -y fzf
 
 # ── 5. host shims ────────────────────────────────────────────────────────────
 # pkg calls pacman/yay/apt from the host, so they must be exported.
@@ -109,6 +111,11 @@ if "$BIN_DIR/pkg" present fzf >/dev/null; then info "ok: host predicate works"; 
 info "Ubuntu name list: $(wc -l < "$HOME/.cache/pkg/apt.names") names"
 info "dry-run routing for 'cowsay':"
 "$BIN_DIR/pkg" add -n cowsay 2>&1 | sed 's/^/    /' || true
+
+# pkg is usable from inside the containers too, and must see only their own world
+for c in "$ARCH_CONTAINER" "$UBUNTU_CONTAINER"; do
+  info "$c sees: $(distrobox enter "$c" -- "$BIN_DIR/pkg" help 2>/dev/null | sed -n 's/^  Currently: //p')"
+done
 
 echo
 info "done — run 'pkg help' for the full command map"

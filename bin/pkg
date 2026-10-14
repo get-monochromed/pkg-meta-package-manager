@@ -6,8 +6,13 @@
 #   Arch container   pacman / yay       entries: arch/name, aur/name
 #   Ubuntu container apt / dpkg         entries: apt/name
 #
+# pkg runs on the Fedora host or from inside either container and only ever uses
+# the worlds reachable from where it is running. Inside a container that is that
+# container's own manager alone, so `pkg add fastfetch` in Ubuntu goes to apt
+# instead of attempting dnf.
+#
 # Interactive (fzf TUI):   install, remove
-# Scriptable (Fedora first, then yay, then apt):
+# Scriptable (priority Fedora -> Arch/yay -> Ubuntu, available worlds only):
 #   add, drop, search, info, update, autoremove, clean, present, missing,
 #   list, refresh
 #
@@ -51,6 +56,93 @@ run() {
   "$@"
 }
 
+# ── environment: where are we, and which worlds can act here? ────────────────
+# A world counts as available only if its tooling can act from where we are.
+# Inside a container the distrobox shims exported to ~/.local/bin hop *out* to
+# the host and then into another container — `pacman -Q fastfetch` inside Ubuntu
+# really answers for Arch — so they must never pass for local tooling. That is
+# how `pkg add fastfetch` in Ubuntu used to "succeed" against Arch's copy.
+
+CONTAINER="${PKG_CONTAINER:-Arch}"
+UBUNTU_CONTAINER="${PKG_UBUNTU_CONTAINER:-Ubuntu}"
+EXPORT_BIN_DIR="${PKG_EXPORT_BIN_DIR:-$HOME/.local/bin}"
+EXPORT_APP_DIR="${PKG_EXPORT_APP_DIR:-$HOME/.local/share/applications}"
+EXPORT_MAX_BINS="${PKG_EXPORT_MAX_BINS:-8}"
+APT_INDEX_DAYS="${PKG_APT_INDEX_DAYS:-7}"
+
+host_cmd()   { command -v "$1" >/dev/null 2>&1; }
+native_cmd() {  # a real binary in this root, not one of the exported shims
+  # ~/.local/bin comes first in PATH, so `command -v pacman` inside the Arch
+  # container answers with the *shim*; search the rest of PATH instead
+  local d
+  local IFS=:
+  for d in $PATH; do
+    [[ -n $d ]] || d=.
+    [[ $d == "$EXPORT_BIN_DIR" ]] && continue
+    [[ -f $d/$1 && -x $d/$1 ]] && return 0
+  done
+  return 1
+}
+
+HERE=""                                  # "", Arch, Ubuntu or "unknown"
+if [[ -n ${CONTAINER_ID:-} ]]; then
+  HERE="$CONTAINER_ID"
+elif [[ -e /run/.containerenv ]]; then
+  # a container that does not name itself: infer from what is really installed
+  if native_cmd apt-get; then HERE="$UBUNTU_CONTAINER"
+  elif native_cmd pacman; then HERE="$CONTAINER"
+  else HERE="unknown"; fi
+fi
+
+FEDORA_HERE=0; ARCH_HERE=0; APT_HERE=0
+if [[ -z $HERE ]]; then                       # on the Fedora host
+  listed="$(timeout 10 distrobox list 2>/dev/null | awk -F'|' 'NR > 1 { gsub(/ /, "", $2); print $2 }')"
+  host_cmd dnf && host_cmd rpm && FEDORA_HERE=1
+  host_cmd pacman && host_cmd yay && grep -qxF "$CONTAINER" <<<"$listed" && ARCH_HERE=1
+  grep -qxF "$UBUNTU_CONTAINER" <<<"$listed" && APT_HERE=1
+elif [[ $HERE == "$CONTAINER" ]]; then        # inside the Arch container
+  native_cmd pacman && native_cmd yay && ARCH_HERE=1
+elif [[ $HERE == "$UBUNTU_CONTAINER" ]]; then  # inside the Ubuntu container
+  native_cmd apt-get && native_cmd dpkg && APT_HERE=1
+else                                          # another container: trust natives
+  native_cmd dnf && native_cmd rpm && FEDORA_HERE=1
+  native_cmd pacman && native_cmd yay && ARCH_HERE=1
+  native_cmd apt-get && native_cmd dpkg && APT_HERE=1
+fi
+
+has_fedora() { (( FEDORA_HERE )); }
+has_arch()   { (( ARCH_HERE )); }
+has_apt()    { (( APT_HERE )); }
+
+WORLDS=()
+has_fedora && WORLDS+=(fedora)
+has_arch   && WORLDS+=(arch)
+has_apt    && WORLDS+=(ubuntu)
+
+world_prefix() {  # world -> the entry prefix it uses
+  case "$1" in
+    fedora) printf dnf ;;
+    arch)   printf arch ;;
+    ubuntu) printf apt ;;
+  esac
+}
+whereami() {
+  [[ -n $HERE ]] && printf 'inside the %s container' "$HERE" || printf 'on the Fedora host'
+}
+worlds_label() {
+  local out=() w s=""
+  has_fedora && out+=("Fedora (dnf)")
+  has_arch   && out+=("Arch/AUR (yay)")
+  has_apt    && out+=("Ubuntu (apt)")
+  for w in "${out[@]}"; do s+="${s:+, }$w"; done
+  printf '%s' "${s:-none}"
+}
+require_worlds() {
+  (( ${#WORLDS[@]} )) && return 0
+  err "no package manager available here ($(whereami)): pkg needs dnf/rpm, pacman/yay or apt/dpkg"
+  return 1
+}
+
 # ── cached name lists ────────────────────────────────────────────────────────
 
 stamp_of() { printf '%s/.stamp.%s' "$CACHE_DIR" "$(basename "$1")"; }
@@ -65,38 +157,67 @@ ensure_lists() {
   local d="$CACHE_DIR/dnf.names" a="$CACHE_DIR/arch.names" u="$CACHE_DIR/aur.names"
   local b="$CACHE_DIR/apt.names"
   touch "$d" "$a" "$u" "$b"
-  if fresh "$d" && fresh "$a" && fresh "$u" && fresh "$b"; then return 0; fi
 
-  printf '%s==>%s refreshing package lists...\n' "$C_D" "$C_0" >&2
+  # only the worlds reachable from here decide whether a refresh is needed; an
+  # unreachable world keeps whatever cache it has (possibly empty)
+  local get_d=0 get_a=0 get_b=0
+  has_fedora && ! fresh "$d" && get_d=1
+  has_arch && { ! fresh "$a" || ! fresh "$u"; } && get_a=1
+  has_apt && ! fresh "$b" && get_b=1
+  (( get_d + get_a + get_b )) || return 0
 
-  if ! fresh "$d"; then
-    if dnf repoquery --available --qf '%{name}\n' 2>/dev/null | sort -u > "$d.tmp" && [[ -s $d.tmp ]]; then
-      mv "$d.tmp" "$d"; stamp "$d"
-    else
-      rm -f "$d.tmp"; warn "dnf: could not refresh the Fedora list (offline?)"
+  local what=() w s=""
+  (( get_d )) && what+=("Fedora")
+  (( get_a )) && what+=("Arch/AUR")
+  (( get_b )) && what+=("Ubuntu")
+  for w in "${what[@]}"; do s+="${s:+, }$w"; done
+  printf '%s==>%s refreshing package lists in parallel (%s)...\n' "$C_D" "$C_0" "$s" >&2
+
+  # The worlds are independent, so their fetches run at the same time: one job
+  # per world, each writing its own .tmp (the AUR list lands in .raw because it
+  # can only be diffed against a freshly fetched repo list, which is also why
+  # the two Arch fetches share a job). Serially this paid a container cold start
+  # per world, on top of the ~3.5 s AUR listing.
+  local pids=()
+  if (( get_d )); then
+    ( dnf repoquery --available --qf '%{name}\n' 2>/dev/null | sort -u > "$d.tmp" ) &
+    pids+=($!)
+  fi
+  if (( get_a )); then
+    ( pacman -Slq  2>/dev/null | sort -u > "$a.tmp"
+      yay    -Slqa 2>/dev/null | sort -u > "$u.raw" ) &
+    pids+=($!)
+  fi
+  if (( get_b )); then
+    ( in_ubuntu apt-cache pkgnames 2>/dev/null | sort -u > "$b.tmp" ) &
+    pids+=($!)
+  fi
+  wait "${pids[@]}" 2>/dev/null || true
+
+  # validate afterwards: a job that died leaves an empty (or missing) .tmp
+  if (( get_d )); then
+    if [[ -s $d.tmp ]]; then mv "$d.tmp" "$d"; stamp "$d"
+    else rm -f "$d.tmp"; warn "dnf: could not refresh the Fedora list (offline?)"
     fi
   fi
-
-  if ! fresh "$a" || ! fresh "$u"; then
-    if pacman -Slq 2>/dev/null | sort -u > "$a.tmp" && [[ -s $a.tmp ]]; then
+  if (( get_a )); then
+    if [[ -s $a.tmp ]]; then
       mv "$a.tmp" "$a"; stamp "$a"
-      if yay -Slqa 2>/dev/null | sort -u > "$u.tmp" && [[ -s $u.tmp ]]; then
+      if [[ -s $u.raw ]]; then
         # AUR names that also exist in the repos are repo packages; drop them
-        comm -23 "$u.tmp" "$a" > "$u.raw" && mv "$u.raw" "$u"; rm -f "$u.tmp"; stamp "$u"
+        comm -23 "$u.raw" "$a" > "$u.tmp" && mv "$u.tmp" "$u" && stamp "$u"
+        rm -f "$u.raw" "$u.tmp"
       else
-        rm -f "$u.tmp"; warn "yay: could not refresh the AUR list"
+        rm -f "$u.raw"; warn "yay: could not refresh the AUR list"
       fi
     else
-      rm -f "$a.tmp" "$u.tmp"
+      rm -f "$a.tmp" "$u.raw"
       warn "Arch container/yay unreachable — arch/ and aur/ entries unavailable"
     fi
   fi
-
-  if ! fresh "$b"; then
-    if in_ubuntu apt-cache pkgnames 2>/dev/null | sort -u > "$b.tmp" && [[ -s $b.tmp ]]; then
-      mv "$b.tmp" "$b"; stamp "$b"
-    else
-      rm -f "$b.tmp"; warn "Ubuntu container unreachable — apt/ entries unavailable"
+  if (( get_b )); then
+    if [[ -s $b.tmp ]]; then mv "$b.tmp" "$b"; stamp "$b"
+    else rm -f "$b.tmp"; warn "Ubuntu container unreachable — apt/ entries unavailable"
     fi
   fi
 }
@@ -111,11 +232,12 @@ build_list() {
   ' "$3" "$2"
 }
 
-rpm_installed_file()  { local f; f="$(mktemp)"; rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
-arch_installed_file() { local f; f="$(mktemp)"; pacman -Qq  2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
-arch_explicit_file()  { local f; f="$(mktemp)"; pacman -Qqe 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
-ubuntu_installed_file() { local f; f="$(mktemp)"; in_ubuntu dpkg-query -W -f '${Package}\n' 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
-ubuntu_explicit_file()  { local f; f="$(mktemp)"; in_ubuntu apt-mark showmanual 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
+empty_file() { local f; f="$(mktemp)"; printf '%s' "$f"; }
+rpm_installed_file()  { has_fedora || { empty_file; return 0; }; local f; f="$(mktemp)"; rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
+arch_installed_file() { has_arch   || { empty_file; return 0; }; local f; f="$(mktemp)"; pacman -Qq  2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
+arch_explicit_file()  { has_arch   || { empty_file; return 0; }; local f; f="$(mktemp)"; pacman -Qqe 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
+ubuntu_installed_file() { has_apt || { empty_file; return 0; }; local f; f="$(mktemp)"; in_ubuntu dpkg-query -W -f '${Package}\n' 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
+ubuntu_explicit_file()  { has_apt || { empty_file; return 0; }; local f; f="$(mktemp)"; in_ubuntu apt-mark showmanual 2>/dev/null | sort -u > "$f"; printf '%s' "$f"; }
 
 # ── preview (called by fzf, one entry at a time) ─────────────────────────────
 
@@ -165,10 +287,14 @@ cmd_preview() {
   name="${name%% *}"
 
   case "$src" in
-    dnf) printf '%s── Fedora (dnf) · %s ──%s\n' "$C_G" "$name" "$C_0" ;;
-    arch) printf '%s── Arch (pacman) · %s ──%s\n' "$C_C" "$name" "$C_0" ;;
-    aur)  printf '%s── AUR (yay) · %s ──%s\n' "$C_M" "$name" "$C_0" ;;
-    apt)  printf '%s── Ubuntu (apt) · %s ──%s\n' "$C_B" "$name" "$C_0" ;;
+    dnf)  has_fedora || { printf '%sdns/ entries are not available here (no dnf/rpm)%s\n' "$C_D" "$C_0"; return 0; }
+          printf '%s── Fedora (dnf) · %s ──%s\n' "$C_G" "$name" "$C_0" ;;
+    arch) has_arch || { printf '%sarch/ entries are not available here%s\n' "$C_D" "$C_0"; return 0; }
+          printf '%s── Arch (pacman) · %s ──%s\n' "$C_C" "$name" "$C_0" ;;
+    aur)  has_arch || { printf '%saur/ entries are not available here%s\n' "$C_D" "$C_0"; return 0; }
+          printf '%s── AUR (yay) · %s ──%s\n' "$C_M" "$name" "$C_0" ;;
+    apt)  has_apt || { printf '%sapt/ entries are not available here%s\n' "$C_D" "$C_0"; return 0; }
+          printf '%s── Ubuntu (apt) · %s ──%s\n' "$C_B" "$name" "$C_0" ;;
     *)    printf 'unknown entry: %s\n' "$entry"; return 0 ;;
   esac
 
@@ -196,31 +322,70 @@ cmd_preview() {
   esac
 }
 
-# ── containers ───────────────────────────────────────────────────────────────
-# Two distrobox containers hold the non-Fedora worlds. CONTAINER and
-# UBUNTU_CONTAINER are the only places a container name is written down, so
-# renaming one is a single edit (or PKG_CONTAINER / PKG_UBUNTU_CONTAINER).
+# ── container primitives ─────────────────────────────────────────────────────
+# CONTAINER / UBUNTU_CONTAINER and the EXPORT_* dirs come from the environment
+# section at the top. in_cont() runs a command *locally* when we are already
+# inside that container: distrobox cannot nest, and every preview, info and
+# export path goes through here.
 
-CONTAINER="${PKG_CONTAINER:-Arch}"
-UBUNTU_CONTAINER="${PKG_UBUNTU_CONTAINER:-Ubuntu}"
-APT_INDEX_DAYS="${PKG_APT_INDEX_DAYS:-7}"
-
-in_arch()   { distrobox enter "$CONTAINER" -- "$@"; }
-in_ubuntu() { distrobox enter "$UBUNTU_CONTAINER" -- "$@"; }
-in_cont()   { distrobox enter "$1" -- "${@:2}"; }
+in_cont() {
+  local c="$1"; shift
+  if [[ $HERE == "$c" ]]; then
+    "$@"
+  else
+    distrobox enter "$c" -- "$@"
+  fi
+}
+in_arch()   { in_cont "$CONTAINER" "$@"; }
+in_ubuntu() { in_cont "$UBUNTU_CONTAINER" "$@"; }
 in_cont_each() { local c="$1" s="$2"; shift 2; (( $# )) || return 0; in_cont "$c" bash -c "$s" pkg "$@"; }
 cont_has_file() { [[ -n "$(in_cont "$1" bash -c '[ -f "$1" ] && echo yes' pkg "$2" 2>/dev/null)" ]]; }
 
 ubuntu_installed() {  # dpkg state inside the Ubuntu container
+  has_apt || return 1
   local s
   s="$(in_ubuntu dpkg-query -W -f '${Status}' "$1" 2>/dev/null)"
   [[ $s == *"install ok installed"* ]]
 }
 
-cont_has_pkg() {  # <container> <pkg>
+# ── per-world accessors ──────────────────────────────────────────────────────
+# Every "is it installed" / "does its repo have it" question goes through these,
+# so an unreachable world answers false instead of running a binary that is not
+# there — or, worse, a shim that quietly acts on another container.
+
+w_installed() {  # <world> <pkg>
   case "$1" in
-    "$UBUNTU_CONTAINER") ubuntu_installed "$2" ;;
-    *)                   in_arch pacman -Q "$2" >/dev/null 2>&1 ;;
+    fedora) has_fedora && rpm -q "$2" >/dev/null 2>&1 ;;
+    arch)   has_arch   && pacman -Q "$2" >/dev/null 2>&1 ;;
+    ubuntu) has_apt    && ubuntu_installed "$2" ;;
+    *) return 1 ;;
+  esac
+}
+w_has() {  # <world> <pkg> — installable from that world's repositories?
+  case "$1" in
+    fedora) has_fedora && in_fedora_repo "$2" ;;
+    arch)   has_arch   && yay -Si "$2" >/dev/null 2>&1 ;;
+    ubuntu) has_apt    && in_ubuntu_repo "$2" ;;
+    *) return 1 ;;
+  esac
+}
+installed_here() {  # does any world available here have it?
+  local w
+  for w in "${WORLDS[@]}"; do w_installed "$w" "$1" && return 0; done
+  return 1
+}
+world_of_entry() {  # dnf/x -> fedora, apt/x -> ubuntu, arch|x/ -> arch
+  case "$1" in
+    dnf/*) printf fedora ;;
+    apt/*) printf ubuntu ;;
+    *)     printf arch ;;
+  esac
+}
+
+cont_has_pkg() {  # <container> <pkg> — false when that world is unreachable
+  case "$1" in
+    "$UBUNTU_CONTAINER") has_apt && ubuntu_installed "$2" ;;
+    *)                   has_arch && in_arch pacman -Q "$2" >/dev/null 2>&1 ;;
   esac
 }
 
@@ -258,9 +423,8 @@ apt_purge() {  # <pkgs...> — the apt equivalent of 'yay -Rns'
 # Never export a name the host already provides, and never delete a file in
 # ~/.local/bin that distrobox did not create.
 
-EXPORT_BIN_DIR="${PKG_EXPORT_BIN_DIR:-$HOME/.local/bin}"
-EXPORT_APP_DIR="${PKG_EXPORT_APP_DIR:-$HOME/.local/share/applications}"
-EXPORT_MAX_BINS="${PKG_EXPORT_MAX_BINS:-8}"
+# EXPORT_BIN_DIR / EXPORT_APP_DIR / EXPORT_MAX_BINS are defined in the
+# environment section at the top.
 
 # one owned file path per line (dpkg -L for Ubuntu, pacman -Ql for Arch)
 cont_owned_files() {  # <container> <pkgs...>
@@ -275,9 +439,16 @@ bin_already_exported() { [[ -f $EXPORT_BIN_DIR/$1 ]] && grep -q distrobox_binary
 bin_dir_taken()        { [[ -e $EXPORT_BIN_DIR/$1 ]] && ! bin_already_exported "$1"; }
 app_already_exported() { compgen -G "$EXPORT_APP_DIR/*-$1" >/dev/null 2>&1; }
 
-# true if the Fedora host provides this command itself (outside ~/.local/bin)
+# true if the Fedora host provides this command itself (outside ~/.local/bin).
+# From inside a container the question is still about the host, so ask it through
+# distrobox-host-exec rather than trusting the container's own PATH.
 host_provides_cmd() {
   local p
+  if [[ -n $HERE ]]; then
+    p="$(distrobox-host-exec bash -c 'type -P "$1"' pkg "$1" 2>/dev/null)" || p=""
+    [[ -n $p ]] && return 0
+    return 1
+  fi
   p="$(type -P "$1" 2>/dev/null)" || return 1
   [[ $p == "$EXPORT_BIN_DIR/"* ]] && return 1
   return 0
@@ -416,19 +587,20 @@ cmd_export() {
     esac
   done
   (( ${#pkgs[@]} )) || { err "usage: pkg export [--app|--bin|--both] [-c <container>] <package>..."; return 1; }
+  require_worlds || return 1
 
-  # whichever container owns the package; Arch wins a tie (same order as add)
+  # whichever reachable container owns the package; Arch wins a tie
   local -A bucket=()
   local p
   for p in "${pkgs[@]}"; do
     if [[ -n $cont ]]; then
       cont_has_pkg "$cont" "$p" || { err "'$p' is not installed in $cont"; return 1; }
-    elif pacman -Q "$p" >/dev/null 2>&1; then
+    elif cont_has_pkg "$CONTAINER" "$p"; then
       cont="$CONTAINER"
-    elif ubuntu_installed "$p"; then
+    elif cont_has_pkg "$UBUNTU_CONTAINER" "$p"; then
       cont="$UBUNTU_CONTAINER"
     else
-      err "'$p' is not installed in any container ($CONTAINER, $UBUNTU_CONTAINER)"; return 1
+      err "'$p' is not installed in any reachable container ($(worlds_label))"; return 1
     fi
     bucket[$cont]+="$p"$'\n'
     cont=""
@@ -444,6 +616,7 @@ cmd_export() {
 
 cmd_unexport() {
   (( $# )) || { err "usage: pkg unexport <package>..."; return 1; }
+  require_worlds || return 1
   local tf rc=0 p c
   tf="$(mktemp)"
   for p in "$@"; do
@@ -478,11 +651,7 @@ verify_installed() {
   local failed=() e name
   for e in "$@"; do
     name="${e#*/}"; name="${name%% *}"
-    case "$e" in
-      dnf/*) rpm -q "$name" >/dev/null 2>&1 || failed+=("$e") ;;
-      apt/*) ubuntu_installed "$name" || failed+=("$e") ;;
-      *)     pacman -Q "$name" >/dev/null 2>&1 || failed+=("$e") ;;
-    esac
+    w_installed "$(world_of_entry "$e")" "$name" || failed+=("$e")
   done
   (( ${#failed[@]} )) && { err "not installed afterwards: ${failed[*]}"; return 1; }
   return 0
@@ -493,11 +662,7 @@ verify_removed() {
   local failed=() e name
   for e in "$@"; do
     name="${e#*/}"; name="${name%% *}"
-    case "$e" in
-      dnf/*) rpm -q "$name" >/dev/null 2>&1 && failed+=("$e") ;;
-      apt/*) ubuntu_installed "$name" && failed+=("$e") ;;
-      *)     pacman -Q "$name" >/dev/null 2>&1 && failed+=("$e") ;;
-    esac
+    w_installed "$(world_of_entry "$e")" "$name" && failed+=("$e")
   done
   (( ${#failed[@]} )) && { err "still installed afterwards: ${failed[*]}"; return 1; }
   return 0
@@ -506,41 +671,57 @@ verify_removed() {
 tui_install() {
   local no_export="${PKG_NO_EXPORT:-}" a
   for a in "$@"; do case "$a" in --no-export) no_export=1 ;; esac; done
+  require_worlds || return 1
   ensure_lists
-  local list rpm_i arch_i apt_i="" sel
-  list="$(mktemp)"; rpm_i="$(rpm_installed_file)"; arch_i="$(arch_installed_file)"
+  local list rpm_i="" arch_i="" apt_i="" sel hdr filter=""
+  list="$(mktemp)"
   {
-    build_list dnf  "$CACHE_DIR/dnf.names"  "$rpm_i"
-    build_list arch "$CACHE_DIR/arch.names" "$arch_i"
-    build_list aur  "$CACHE_DIR/aur.names"  "$arch_i"
+    if has_fedora; then
+      rpm_i="$(rpm_installed_file)"
+      build_list dnf "$CACHE_DIR/dnf.names" "$rpm_i"
+      filter+="dnf/ "
+    fi
+    if has_arch; then
+      arch_i="$(arch_installed_file)"
+      build_list arch "$CACHE_DIR/arch.names" "$arch_i"
+      build_list aur  "$CACHE_DIR/aur.names"  "$arch_i"
+      filter+="arch/ aur/ "
+    fi
     # an empty apt name list means the Ubuntu container was unreachable
-    # (ensure_lists already warned); don't pay a container roundtrip for it
-    if [[ -s $CACHE_DIR/apt.names ]]; then
+    if has_apt && [[ -s $CACHE_DIR/apt.names ]]; then
       apt_i="$(ubuntu_installed_file)"
       build_list apt "$CACHE_DIR/apt.names" "$apt_i"
+      filter+="apt/ "
     fi
   } > "$list"
+
+  hdr='tab: select · enter: install · alt-p: preview'
+  has_arch && hdr+=' · alt-b: PKGBUILD (AUR)'
+  hdr+=" · type ${filter}to filter"
 
   sel="$(PKG_COLOR=1 fzf "${fzf_common[@]}" \
       --color='pointer:green,marker:green' \
       --prompt='install > ' \
-      --header='tab: select · enter: install · alt-p: preview · alt-b: PKGBUILD (AUR) · type dnf/ arch/ aur/ apt/ to filter' \
+      --header="$hdr" \
       --preview "'$SELF' __preview install {1}" \
-      --preview-label='alt-p toggle · alt-j/k scroll · alt-b PKGBUILD' \
+      --preview-label='alt-p toggle · alt-j/k scroll' \
       --bind "alt-b:change-preview('$SELF' __preview pkgbuild {1})" \
       --bind "alt-B:change-preview('$SELF' __preview install {1})" \
       < "$list")"
-  rm -f "$list" "$rpm_i" "$arch_i"
-  [[ -n $apt_i ]] && rm -f "$apt_i"
+  rm -f "$list"
+  [[ -n $rpm_i ]]  && rm -f "$rpm_i"
+  [[ -n $arch_i ]] && rm -f "$arch_i"
+  [[ -n $apt_i ]]  && rm -f "$apt_i"
 
   [[ -n ${sel:-} ]] || { msg "nothing selected"; return 0; }
   local picked fedora=() yayp=() ubuntup=() e
   mapfile -t picked < <(printf '%s\n' "$sel" | awk '{print $1}' | sort -u)
   for e in "${picked[@]}"; do
     case "$e" in
-      dnf/*)  fedora+=("${e#*/}") ;;
-      apt/*)  ubuntup+=("${e#*/}") ;;
-      *)      yayp+=("${e#*/}") ;;
+      dnf/*)        has_fedora && fedora+=("${e#*/}") ;;
+      arch/*|aur/*) has_arch   && yayp+=("${e#*/}") ;;
+      apt/*)        has_apt    && ubuntup+=("${e#*/}") ;;
+      *)            warn "ignoring entry from an unavailable world: $e" ;;
     esac
   done
 
@@ -564,31 +745,48 @@ tui_install() {
 tui_remove() {
   local no_export="${PKG_NO_EXPORT:-}" a
   for a in "$@"; do case "$a" in --no-export) no_export=1 ;; esac; done
-  ensure_lists
-  local list rpm_i arch_i apt_i sel
-  list="$(mktemp)"; rpm_i="$(rpm_installed_file)"; arch_i="$(arch_explicit_file)"
-  apt_i="$(ubuntu_explicit_file)"
-  { sed 's|^|dnf/|' "$rpm_i"; sed 's|^|arch/|' "$arch_i"
-    [[ -s $apt_i ]] && sed 's|^|apt/|' "$apt_i"; } > "$list"
+  require_worlds || return 1
+  local list rpm_i="" arch_i="" apt_i="" sel hdr filter=""
+  list="$(mktemp)"
+  {
+    if has_fedora; then
+      rpm_i="$(rpm_installed_file)"
+      sed 's|^|dnf/|' "$rpm_i"
+      filter+="dnf/ "
+    fi
+    if has_arch; then
+      arch_i="$(arch_explicit_file)"
+      sed 's|^|arch/|' "$arch_i"
+      filter+="arch/ "
+    fi
+    if has_apt; then
+      apt_i="$(ubuntu_explicit_file)"
+      [[ -s $apt_i ]] && sed 's|^|apt/|' "$apt_i"
+      filter+="apt/ "
+    fi
+  } > "$list"
 
+  hdr="tab: select · enter: REMOVE · alt-p: preview · type ${filter}to filter"
   sel="$(PKG_COLOR=1 fzf "${fzf_common[@]}" \
       --color='pointer:red,marker:red' \
       --prompt='remove > ' \
-      --header='tab: select · enter: REMOVE · alt-p: preview · type dnf/, arch/ or apt/ to filter' \
+      --header="$hdr" \
       --preview "'$SELF' __preview remove {1}" \
       --preview-label='alt-p toggle · alt-j/k scroll' \
       < "$list")"
-  rm -f "$list" "$rpm_i" "$arch_i"
-  [[ -n $apt_i ]] && rm -f "$apt_i"
+  rm -f "$list"
+  [[ -n $rpm_i ]]  && rm -f "$rpm_i"
+  [[ -n $arch_i ]] && rm -f "$arch_i"
+  [[ -n $apt_i ]]  && rm -f "$apt_i"
 
   [[ -n ${sel:-} ]] || { msg "nothing selected"; return 0; }
   local picked fedora=() archp=() ubuntup=() e
   mapfile -t picked < <(printf '%s\n' "$sel" | awk '{print $1}' | sort -u)
   for e in "${picked[@]}"; do
     case "$e" in
-      dnf/*)  fedora+=("${e#*/}") ;;
-      apt/*)  ubuntup+=("${e#*/}") ;;
-      *)      archp+=("${e#*/}") ;;
+      dnf/*)  has_fedora && fedora+=("${e#*/}") ;;
+      apt/*)  has_apt    && ubuntup+=("${e#*/}") ;;
+      *)      has_arch   && archp+=("${e#*/}") ;;
     esac
   done
 
@@ -611,12 +809,14 @@ tui_remove() {
 # ── scriptable commands (Fedora first, then yay) ─────────────────────────────
 
 in_fedora_repo() {  # exact-name check, cache first then live
+  has_fedora || return 1
   local p="$1"
   [[ -s $CACHE_DIR/dnf.names ]] && grep -qxF "$p" "$CACHE_DIR/dnf.names" && return 0
   dnf repoquery --available --qf '%{name}\n' "$p" 2>/dev/null | grep -qxF "$p"
 }
 
 in_ubuntu_repo() {  # exact-name check, cache first then live
+  has_apt || return 1
   local p="$1"
   [[ -s $CACHE_DIR/apt.names ]] && grep -qxF "$p" "$CACHE_DIR/apt.names" && return 0
   in_ubuntu apt-cache show "$p" >/dev/null 2>&1
@@ -632,37 +832,44 @@ cmd_add() {
     esac
   done
   (( ${#pkgs[@]} )) || { err "usage: pkg add [-n|--dry-run] [--no-export] <package>..."; return 1; }
+  require_worlds || return 1
   ensure_lists
 
-  local fedora=() yayp=() ubuntup=() unknown=() p
+  # the first available world that has it wins; unreachable worlds are never asked
+  local fedora=() yayp=() ubuntup=() unknown=() p w
   for p in "${pkgs[@]}"; do
-    if rpm -q "$p" >/dev/null 2>&1; then
-      printf '%sdnf/%s already installed — skipping%s\n' "$C_D" "$p" "$C_0" >&2; continue
-    fi
-    if in_fedora_repo "$p"; then fedora+=("$p"); continue; fi
-    if pacman -Q "$p" >/dev/null 2>&1; then
-      printf '%sarch/%s already installed — skipping%s\n' "$C_D" "$p" "$C_0" >&2; continue
-    fi
-    # Fedora has no such package: yay resolves it against repos *and* the AUR
-    if yay -Si "$p" >/dev/null 2>&1; then yayp+=("$p"); continue; fi
-    if ubuntu_installed "$p"; then
-      printf '%sapt/%s already installed — skipping%s\n' "$C_D" "$p" "$C_0" >&2; continue
-    fi
-    # Ubuntu is the last resort: only what Fedora *and* Arch/AUR lack
-    if in_ubuntu_repo "$p"; then ubuntup+=("$p"); continue; fi
-    unknown+=("$p")
+    local claimed=0
+    for w in "${WORLDS[@]}"; do
+      if w_installed "$w" "$p"; then
+        printf '%s%s/%s already installed — skipping%s\n' "$C_D" "$(world_prefix "$w")" "$p" "$C_0" >&2
+        claimed=1; break
+      fi
+      if w_has "$w" "$p"; then
+        case "$w" in
+          fedora) fedora+=("$p") ;;
+          arch)   yayp+=("$p") ;;
+          ubuntu) ubuntup+=("$p") ;;
+        esac
+        claimed=1; break
+      fi
+    done
+    (( claimed )) || unknown+=("$p")
   done
 
   local rc=0
   if (( ${#fedora[@]} )); then  run sudo dnf install -y "${fedora[@]}" || rc=1; fi
   if (( ${#yayp[@]} )); then    run yay -S --noconfirm --needed "${yayp[@]}" || rc=1; fi
   if (( ${#ubuntup[@]} )); then apt_install "${ubuntup[@]}" || rc=1; fi
-  if (( ${#unknown[@]} )); then err "not found in Fedora, Arch/AUR or Ubuntu: ${unknown[*]}"; rc=1; fi
+  if (( ${#unknown[@]} )); then
+    err "not found in $(worlds_label): ${unknown[*]}"
+    [[ -n $HERE ]] && err "hint: $(whereami), so only $(worlds_label) is reachable — run pkg on the Fedora host for the other worlds"
+    rc=1
+  fi
 
   local present=() e
   if (( ! DRY_RUN )); then
     for e in "${pkgs[@]}"; do
-      if rpm -q "$e" >/dev/null 2>&1 || pacman -Q "$e" >/dev/null 2>&1 || ubuntu_installed "$e"; then
+      if installed_here "$e"; then
         present+=("$e")
       else
         [[ " ${unknown[*]} " == *" $e "* ]] || err "'$e' did not install"
@@ -691,13 +898,22 @@ cmd_drop() {
     esac
   done
   (( ${#pkgs[@]} )) || { err "usage: pkg drop [-n|--dry-run] [--no-export] <package>..."; return 1; }
+  require_worlds || return 1
 
-  local fedora=() archp=() ubuntup=() p
+  local fedora=() archp=() ubuntup=() p w
   for p in "${pkgs[@]}"; do
-    if rpm -q "$p" >/dev/null 2>&1; then fedora+=("$p")
-    elif pacman -Q "$p" >/dev/null 2>&1; then archp+=("$p")
-    elif ubuntu_installed "$p"; then ubuntup+=("$p")
-    else printf '%s%s is not installed — ignoring%s\n' "$C_D" "$p" "$C_0" >&2; fi
+    local found=0
+    for w in "${WORLDS[@]}"; do
+      if w_installed "$w" "$p"; then
+        case "$w" in
+          fedora) fedora+=("$p") ;;
+          arch)   archp+=("$p") ;;
+          ubuntu) ubuntup+=("$p") ;;
+        esac
+        found=1; break
+      fi
+    done
+    (( found )) || printf '%s%s is not installed — ignoring%s\n' "$C_D" "$p" "$C_0" >&2
   done
   (( ${#fedora[@]} + ${#archp[@]} + ${#ubuntup[@]} )) || { info "nothing to remove"; return 0; }
 
@@ -721,12 +937,19 @@ cmd_drop() {
 
 cmd_search() {
   (( $# )) || { err "usage: pkg search <term>..."; return 1; }
-  printf '%s=== Fedora (dnf) ===%s\n' "$C_G" "$C_0"
-  dnf -q search "$@" 2>&1
-  printf '\n%s=== Arch / AUR (yay) ===%s\n' "$C_M" "$C_0"
-  yay -Ss "$@" 2>&1
-  printf '\n%s=== Ubuntu (apt) ===%s\n' "$C_B" "$C_0"
-  in_ubuntu apt-cache search -- "$@" 2>&1
+  require_worlds || return 1
+  if has_fedora; then
+    printf '%s=== Fedora (dnf) ===%s\n' "$C_G" "$C_0"
+    dnf -q search "$@" 2>&1
+  fi
+  if has_arch; then
+    printf '\n%s=== Arch / AUR (yay) ===%s\n' "$C_M" "$C_0"
+    yay -Ss "$@" 2>&1
+  fi
+  if has_apt; then
+    printf '\n%s=== Ubuntu (apt) ===%s\n' "$C_B" "$C_0"
+    in_ubuntu apt-cache search -- "$@" 2>&1
+  fi
 }
 
 cmd_info() {
@@ -766,14 +989,30 @@ cmd_info() {
 
 cmd_update() {
   local rc=0
-  info "updating Fedora (dnf)"
-  run sudo dnf upgrade --refresh -y || rc=1
-  info "updating Arch container (yay)"
-  run yay -Syu --noconfirm || rc=1
-  info "updating Ubuntu container (apt)"
-  run in_ubuntu sudo apt-get update || rc=1
-  run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || rc=1
-  if command -v flatpak >/dev/null 2>&1; then
+  if has_fedora; then
+    info "updating Fedora (dnf)"
+    run sudo dnf upgrade --refresh -y || rc=1
+  else
+    info "skipping Fedora (dnf) — not available here"
+  fi
+  if has_arch; then
+    info "updating Arch container (yay)"
+    run yay -Syu --noconfirm || rc=1
+  else
+    info "skipping Arch (yay) — not available here"
+  fi
+  if has_apt; then
+    info "updating Ubuntu container (apt)"
+    run in_ubuntu sudo apt-get update || rc=1
+    run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || rc=1
+  else
+    info "skipping Ubuntu (apt) — not available here"
+  fi
+  # Flatpak is a Fedora-host concern (Discover installs them); a container has
+  # its own flatpak and system installation, so leave that step to the host
+  if [[ -n $HERE ]]; then
+    info "skipping Flatpaks — host-side only"
+  elif command -v flatpak >/dev/null 2>&1; then
     info "updating Flatpaks"
     run flatpak update -y || rc=1
   fi
@@ -782,41 +1021,63 @@ cmd_update() {
 
 cmd_autoremove() {
   local rc=0
-  info "removing orphaned Fedora packages (dnf autoremove)"
-  run sudo dnf autoremove -y || rc=1
-  info "removing orphaned Arch packages (yay -Yc)"
-  run yay -Yc --noconfirm || rc=1
-  info "removing orphaned Ubuntu packages (apt autoremove)"
-  run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || rc=1
+  if has_fedora; then
+    info "removing orphaned Fedora packages (dnf autoremove)"
+    run sudo dnf autoremove -y || rc=1
+  else
+    info "skipping Fedora (dnf) — not available here"
+  fi
+  if has_arch; then
+    info "removing orphaned Arch packages (yay -Yc)"
+    run yay -Yc --noconfirm || rc=1
+  else
+    info "skipping Arch (yay) — not available here"
+  fi
+  if has_apt; then
+    info "removing orphaned Ubuntu packages (apt autoremove)"
+    run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || rc=1
+  else
+    info "skipping Ubuntu (apt) — not available here"
+  fi
   return $rc
 }
 
 cmd_clean() {
   local rc=0
-  info "cleaning dnf cache"
-  run sudo dnf clean all || rc=1
-  info "cleaning Arch/yay cache"
-  run yay -Scc --noconfirm || rc=1
-  info "cleaning apt cache"
-  run in_ubuntu sudo apt-get clean || rc=1
+  if has_fedora; then
+    info "cleaning dnf cache"
+    run sudo dnf clean all || rc=1
+  else
+    info "skipping Fedora (dnf) — not available here"
+  fi
+  if has_arch; then
+    info "cleaning Arch/yay cache"
+    run yay -Scc --noconfirm || rc=1
+  else
+    info "skipping Arch (yay) — not available here"
+  fi
+  if has_apt; then
+    info "cleaning apt cache"
+    run in_ubuntu sudo apt-get clean || rc=1
+  else
+    info "skipping Ubuntu (apt) — not available here"
+  fi
   return $rc
 }
 
 cmd_present() {
   (( $# )) || { err "usage: pkg present <package>..."; return 1; }
+  require_worlds || return 1
   local p
-  for p in "$@"; do
-    rpm -q "$p" >/dev/null 2>&1 || pacman -Q "$p" >/dev/null 2>&1 || ubuntu_installed "$p" || return 1
-  done
+  for p in "$@"; do installed_here "$p" || return 1; done
   return 0
 }
 
 cmd_missing() {
   (( $# )) || { err "usage: pkg missing <package>..."; return 1; }
+  require_worlds || return 1
   local p
-  for p in "$@"; do
-    rpm -q "$p" >/dev/null 2>&1 || pacman -Q "$p" >/dev/null 2>&1 || ubuntu_installed "$p" || return 0
-  done
+  for p in "$@"; do installed_here "$p" || return 0; done
   return 1
 }
 
@@ -840,41 +1101,53 @@ cmd_list() {
 
   case "$scope" in
     installed)
-      local rpm_i arch_i apt_i
-      rpm_i="$(rpm_installed_file)"; arch_i="$(arch_explicit_file)"; apt_i="$(ubuntu_explicit_file)"
+      local rpm_i="" arch_i="" apt_i=""
+      has_fedora && rpm_i="$(rpm_installed_file)"
+      has_arch   && arch_i="$(arch_explicit_file)"
+      has_apt    && apt_i="$(ubuntu_explicit_file)"
       if (( json )); then
-        json_marks "$rpm_i"  dnf  true
-        json_marks "$arch_i" arch true
-        json_marks "$apt_i"  apt  true
+        [[ -n $rpm_i  ]] && json_marks "$rpm_i"  dnf  true
+        [[ -n $arch_i ]] && json_marks "$arch_i" arch true
+        [[ -n $apt_i  ]] && json_marks "$apt_i"  apt  true
       else
-        sed 's|^|dnf/|' "$rpm_i"
-        sed 's|^|arch/|' "$arch_i"
-        sed 's|^|apt/|' "$apt_i"
+        [[ -n $rpm_i  ]] && sed 's|^|dnf/|'  "$rpm_i"
+        [[ -n $arch_i ]] && sed 's|^|arch/|' "$arch_i"
+        [[ -n $apt_i  ]] && sed 's|^|apt/|'  "$apt_i"
       fi
-      rm -f "$rpm_i" "$arch_i" "$apt_i" ;;
+      rm -f "$rpm_i" "$arch_i" "$apt_i"
+      return 0 ;;
     dnf|arch|aur|apt)
+      case "$scope" in
+        dnf)      has_fedora || { err "list: Fedora (dnf) is not available here"; return 1; } ;;
+        arch|aur) has_arch   || { err "list: Arch/AUR (pacman/yay) is not available here"; return 1; } ;;
+        apt)      has_apt    || { err "list: Ubuntu (apt) is not available here"; return 1; } ;;
+      esac
       ensure_lists
       if (( json )); then
         json_marks "$CACHE_DIR/$scope.names" "$scope" false
       else
         sed "s|^|$scope/|" "$CACHE_DIR/$scope.names"
-      fi ;;
+      fi
+      return 0 ;;
     available)
       ensure_lists
-      local rpm_i arch_i apt_i
-      rpm_i="$(rpm_installed_file)"; arch_i="$(arch_installed_file)"; apt_i="$(ubuntu_installed_file)"
+      local rpm_i="" arch_i="" apt_i=""
+      has_fedora && rpm_i="$(rpm_installed_file)"
+      has_arch   && arch_i="$(arch_installed_file)"
+      has_apt    && apt_i="$(ubuntu_installed_file)"
       if (( json )); then
-        json_scan "$CACHE_DIR/dnf.names"  "$rpm_i"  dnf
-        json_scan "$CACHE_DIR/arch.names" "$arch_i" arch
-        json_scan "$CACHE_DIR/aur.names"  "$arch_i" aur
-        json_scan "$CACHE_DIR/apt.names"  "$apt_i"  apt
+        [[ -n $rpm_i  ]] && json_scan "$CACHE_DIR/dnf.names"  "$rpm_i"  dnf
+        [[ -n $arch_i ]] && json_scan "$CACHE_DIR/arch.names" "$arch_i" arch
+        [[ -n $arch_i ]] && json_scan "$CACHE_DIR/aur.names"  "$arch_i" aur
+        [[ -n $apt_i  ]] && json_scan "$CACHE_DIR/apt.names"  "$apt_i"  apt
       else
-        build_list dnf  "$CACHE_DIR/dnf.names"  "$rpm_i"
-        build_list arch "$CACHE_DIR/arch.names" "$arch_i"
-        build_list aur  "$CACHE_DIR/aur.names"  "$arch_i"
-        build_list apt  "$CACHE_DIR/apt.names"  "$apt_i"
+        [[ -n $rpm_i  ]] && build_list dnf  "$CACHE_DIR/dnf.names"  "$rpm_i"
+        [[ -n $arch_i ]] && build_list arch "$CACHE_DIR/arch.names" "$arch_i"
+        [[ -n $arch_i ]] && build_list aur  "$CACHE_DIR/aur.names"  "$arch_i"
+        [[ -n $apt_i  ]] && build_list apt  "$CACHE_DIR/apt.names"  "$apt_i"
       fi
-      rm -f "$rpm_i" "$arch_i" "$apt_i" ;;
+      rm -f "$rpm_i" "$arch_i" "$apt_i"
+      return 0 ;;
     *)
       err "list: unknown scope '$scope' (installed|available|dnf|arch|aur|apt)"; return 1 ;;
   esac
@@ -884,12 +1157,14 @@ cmd_refresh() {
   info "clearing cached package lists"
   rm -f "$CACHE_DIR"/.stamp.*
   rm -rf "$INFO_DIR"
-  if [[ -t 1 || -t 2 ]]; then
+  if has_fedora && [[ -t 1 || -t 2 ]]; then
     info "refreshing dnf metadata"
     run sudo dnf makecache || warn "dnf makecache failed"
   fi
-  info "refreshing the Ubuntu package index (apt-get update)"
-  run in_ubuntu sudo apt-get update || warn "apt-get update failed"
+  if has_apt; then
+    info "refreshing the Ubuntu package index (apt-get update)"
+    run in_ubuntu sudo apt-get update || warn "apt-get update failed"
+  fi
   ensure_lists
   info "done"
 }
@@ -924,9 +1199,12 @@ Worlds
   Fedora host       dnf / rpm      the host's own packages — always tried first
   Arch container    pacman / yay   repos + AUR (yay decides which); second
   Ubuntu container  apt / dpkg     third: only for what Fedora and Arch/AUR lack
+EOF
+  printf '  Currently: %s — available here: %s\n' "$(whereami)" "$(worlds_label)"
+  cat <<'EOF'
 
 Exports (container packages only — the Fedora world is already on the host)
-  Anything pkg installs in the container is exported to the Fedora host right
+  Anything pkg installs in a container is exported to the Fedora host right
   after install, and un-exported right before removal:
       GUI package (owns a visible .desktop)  ->  distrobox-export --app   (~/.local/share/applications)
       terminal package (owns executables)    ->  distrobox-export --bin   (~/.local/bin)
@@ -937,6 +1215,11 @@ Exports (container packages only — the Fedora world is already on the host)
   the whole step.
 
 Notes
+  pkg only touches the worlds reachable from where it runs, and says which ones
+  those are (see 'Currently' above). On the Fedora host that is dnf, then
+  Arch/yay, then Ubuntu/apt. Inside the Ubuntu container it is apt alone —
+  dnf and the Arch world are reported as skipped, never attempted, so there is
+  no "dnf: command not found". Inside the Arch container it is pacman/yay alone.
   -n/--dry-run or PKG_DRY_RUN=1 prints commands instead of running them.
   --json prints JSON Lines: one {"source","name","installed"} object per line.
   Lists live in ~/.cache/pkg (PKG_CACHE_TTL seconds, default 24 h); preview
