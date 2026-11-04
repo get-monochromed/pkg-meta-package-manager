@@ -26,6 +26,25 @@ After the batches run, re-check every requested name (`rpm -q` / `pacman -Q` /
 having registered a package. Guard that check behind the dry-run flag, or every dry
 run reports "did not install".
 
+## Contents queries
+
+`pkg contains [--all] <package>...` walks reachable worlds in the usual priority
+order; in each world an installed package or a repository match selects that
+world. It does not silently switch to a different world when a file query fails.
+`contains_files` uses `dnf -q repoquery -l`, `pacman -Qlq` (installed Arch),
+`pacman -Flq` (uninstalled Arch repo), or `dpkg-query -L` (installed Ubuntu).
+Arch repo paths are normalized to absolute paths. Arch file metadata must first
+be downloaded with `distrobox enter Arch -- sudo pacman -Fy`; query failures
+print that refresh hint. Uninstalled AUR and Ubuntu packages produce a clear
+unsupported-query error rather than invented results or an implicit install.
+
+`--all` returns all paths; the default filters bin/sbin paths to deduplicated
+basenames. Backend stderr is not filtered, pipefail preserves backend errors,
+and source labels go to stderr to keep stdout usable in scripts. Empty command
+output for a package without commands is successful. Multiple-package failures
+are accumulated into a nonzero final status. Integration checks:
+`python3 -m unittest discover -s tests -v` (configured host/containers required).
+
 ## Data sources
 
 | List | Command | Size | Cost |

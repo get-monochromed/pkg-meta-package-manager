@@ -1014,6 +1014,65 @@ cmd_info() {
   done
 }
 
+# File-list backends return paths only; diagnostics stay on stderr.
+contains_files() {
+  local w="$1" p="$2"
+  case "$w" in
+    fedora) dnf -q repoquery -l "$p" ;;
+    arch)
+      if w_installed arch "$p"; then
+        pacman -Qlq "$p"
+      elif pacman -Si "$p" >/dev/null 2>&1; then
+        pacman -Flq "$p" | awk 'NF { sub(/^\/*/, "/"); print }'
+        local rc=$?
+        (( rc == 0 )) || err "Arch file query failed; refresh its file database with: distrobox enter $CONTAINER -- sudo pacman -Fy"
+        return "$rc"
+      else
+        err "$p: uninstalled AUR packages have no file list; install it first"
+        return 1
+      fi ;;
+    ubuntu)
+      if w_installed ubuntu "$p"; then
+        in_ubuntu dpkg-query -L "$p"
+      else
+        err "$p: Ubuntu file lists are supported for installed packages only (dpkg-query -L)"
+        return 1
+      fi ;;
+  esac
+}
+
+cmd_contains() {
+  local all=0 a p w found rc=0
+  local -a pkgs=()
+  for a in "$@"; do
+    case "$a" in
+      --all) all=1 ;;
+      -*) err "unknown contains option: $a"; return 1 ;;
+      *) pkgs+=("$a") ;;
+    esac
+  done
+  (( ${#pkgs[@]} )) || { err "usage: pkg contains [--all] <package>..."; return 1; }
+  require_worlds || return 1
+  for p in "${pkgs[@]}"; do
+    found=0
+    for w in "${WORLDS[@]}"; do
+      if w_installed "$w" "$p" || w_has "$w" "$p"; then
+        found=1
+        info "$p ($(world_prefix "$w"))"
+        if (( all )); then
+          contains_files "$w" "$p" || rc=1
+        else
+          contains_files "$w" "$p" |
+            awk -F/ '/^\/(usr\/)?(local\/)?s?bin\/[^/]+$/ && !seen[$NF]++ { print $NF }' || rc=1
+        fi
+        break
+      fi
+    done
+    if (( ! found )); then err "no package named '$p' in $(worlds_label)"; rc=1; fi
+  done
+  return "$rc"
+}
+
 cmd_update() {
   local rc=0
   if has_fedora; then
@@ -1210,6 +1269,7 @@ Scriptable — Fedora is tried first, yay second, apt last
   pkg drop [-n] <pkgs...>     remove if installed, ignore the rest
   pkg search <term>...        dnf search + yay -Ss + apt-cache search
   pkg info [-a] <pkg>...      dnf info, else pacman -Sii, else yay -Siia, else apt-cache show
+  pkg contains [--all] <pkg>... command names; --all lists every file (Fedora -> Arch -> Ubuntu)
   pkg update                  dnf upgrade --refresh + yay -Syu + apt update&upgrade + flatpak update
   pkg autoremove              dnf autoremove + yay -Yc + apt autoremove --purge (orphans)
   pkg clean                   dnf clean all + yay -Scc + apt clean
@@ -1267,6 +1327,7 @@ case "${1:-help}" in
   drop)           shift; cmd_drop "$@" ;;
   search|find)    shift; cmd_search "$@" ;;
   info|show)      shift; cmd_info "$@" ;;
+  contains)       shift; cmd_contains "$@" ;;
   update|upgrade) shift; cmd_update "$@" ;;
   autoremove)     shift; cmd_autoremove "$@" ;;
   clean)          shift; cmd_clean "$@" ;;

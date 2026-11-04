@@ -102,6 +102,7 @@ pkg add [-n] <pkgs...>       install; already-installed names are skipped
 pkg drop [-n] <pkgs...>      remove what is installed, ignore the rest
 pkg search <term>...         dnf search + yay -Ss + apt-cache search
 pkg info [-a] <pkg>...       dnf info, else pacman -Sii, else yay -Siia, else apt-cache show
+pkg contains [--all] <pkg>... command names, or every file with --all
 pkg update                   dnf upgrade --refresh + yay -Syu + apt update/upgrade + flatpak update
                              (worlds that are not reachable, and the Flatpak step
                              inside a container, are skipped with a note)
@@ -118,6 +119,23 @@ pkg help
 
 `-n` / `PKG_DRY_RUN=1` prints the commands instead of running them, which is how
 routing gets tested without side effects.
+
+## Package contents
+
+`pkg contains bash` lists deduplicated command basenames from bin/sbin directories.
+`pkg contains --all bash` lists every package path instead; `--all` can also follow
+the name, and multiple names are accepted. It uses the first matching reachable
+world in Fedora → Arch → Ubuntu order. Source labels go to stderr.
+
+- Fedora: `dnf repoquery -l`, including packages not installed.
+- Arch: `pacman -Qlq` for installed packages (including AUR), `pacman -Flq` for
+  uninstalled repo packages. Initialize/update its file database with
+  `distrobox enter Arch -- sudo pacman -Fy`. Uninstalled AUR packages cannot be
+  listed without building/installing them.
+- Ubuntu: `dpkg-query -L`, installed packages only; no extra dependency required.
+
+The default is a path-based command filter, not a check for ELF format or execute
+permissions. Packages with no bin/sbin entries produce no names.
 
 ## Exports: the containers reach the host
 
