@@ -1,0 +1,10 @@
+[Unit]
+Description=Check pkg updates daily
+
+[Timer]
+OnStartupSec=10min
+OnUnitActiveSec=24h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Headless bridge for the pkg Plasma notifier; standard library only."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+CACHE = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'pkg'
+SELF = Path(__file__).resolve()
+PKG = os.environ.get('PKG_UPDATES_PKG', str(SELF.with_name('pkg')))
+WORLDS = ('dnf', 'arch', 'ubuntu', 'flatpak')
+
+
+def initial():
+    return dict(ok=False, checked_at=None, total=0,
+                counts=dict.fromkeys(WORLDS), status=dict.fromkeys(WORLDS, 'unknown'))
+
+
+def read_state(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return initial()
+
+
+def save_state(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data) + '\n')
+    tmp.replace(path)
+
+
+def check(path, notify=True, wait=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix('.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            return 0
+        try:
+            result = subprocess.run([PKG, 'update', '--json'], text=True,
+                                    capture_output=True, timeout=900)
+            data = json.loads(result.stdout)
+            assert set(data['counts']) == set(WORLDS)
+            assert all(v is None or (type(v) is int and v >= 0)
+                       for v in data['counts'].values())
+            data['ok'] = data['ok'] is True and result.returncode == 0
+            if result.stderr.strip():
+                data['error'] = result.stderr.strip()[-3000:]
+        except (OSError, ValueError, KeyError, AssertionError, subprocess.TimeoutExpired) as exc:
+            data = initial() | dict(checked_at=int(time.time()), error=str(exc))
+        save_state(path, data)
+        if notify and data['ok'] and data['total'] > 0:
+            text = ' · '.join(f'{label}: {data["counts"][w]}' for w, label in
+                              zip(WORLDS, ('DNF', 'Arch/AUR', 'Ubuntu', 'Flatpak')))
+            try:
+                subprocess.run(['notify-send', '-a', 'pkg', '-i', 'system-software-update',
+                                f'{data["total"]} package updates available',
+                                text + '\nClick the pkg panel widget to upgrade.'], timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        print(json.dumps(data))
+        return 0 if data['ok'] else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--state-file', type=Path, default=CACHE / 'updates.json')
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('check', help='refresh counts without installing anything')
+    p.add_argument('--no-notify', action='store_true')
+    sub.add_parser('state', help='print cached JSON, no package manager calls')
+    p = sub.add_parser('launch', help='open the exact widget upgrade action in Konsole')
+    p.add_argument('--dry-run', action='store_true', help='print argv as JSON without opening a terminal')
+    sub.add_parser('upgrade', help='run pkg upgrade, then refresh the widget counts')
+    p = sub.add_parser('schedule', help='set the systemd user timer interval')
+    p.add_argument('--hours', type=int, choices=(24, 48), required=True)
+    args = parser.parse_args()
+    if args.command == 'state':
+        print(json.dumps(read_state(args.state_file)))
+        return 0
+    if args.command == 'check':
+        return check(args.state_file, not args.no_notify)
+    if args.command == 'launch':
+        command = ['konsole', '--hold', '-e', str(SELF), '--state-file',
+                   str(args.state_file), 'upgrade']
+        if args.dry_run:
+            print(json.dumps(command))
+        else:
+            subprocess.Popen(command, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+    if args.command == 'upgrade':
+        args.state_file.parent.mkdir(parents=True, exist_ok=True)
+        with args.state_file.with_suffix('.upgrade.lock').open('w') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('pkg upgrade is already running.', file=sys.stderr)
+                return 1
+            result = subprocess.run([PKG, 'upgrade'])
+            check(args.state_file, notify=False, wait=True)
+            return result.returncode
+    if args.command == 'schedule':
+        config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+        dropin = config / 'systemd/user/pkg-updates.timer.d/interval.conf'
+        dropin.parent.mkdir(parents=True, exist_ok=True)
+        # Empty monotonic settings reset ALL monotonic triggers, not just this key.
+        dropin.write_text(f'[Timer]\nOnUnitActiveSec=\nOnStartupSec=10min\nOnUnitActiveSec={args.hours}h\n')
+        subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+        subprocess.run(['systemctl', '--user', 'restart', 'pkg-updates.timer'], check=True)
+        print(f'Checking every {args.hours} hours.')
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

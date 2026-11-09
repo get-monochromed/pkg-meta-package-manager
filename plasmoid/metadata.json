@@ -1,0 +1,14 @@
+{
+  "KPlugin": {
+    "Id": "com.monochrome.pkgupdates",
+    "Name": "pkg Updates",
+    "Description": "DNF, Arch/AUR, Ubuntu and Flatpak update counts. Click to upgrade everything in Konsole.",
+    "Icon": "system-software-update",
+    "Version": "1.0.0",
+    "License": "MIT",
+    "Authors": [{"Name": "Hermes"}],
+    "Category": "System Information"
+  },
+  "KPackageStructure": "Plasma/Applet",
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

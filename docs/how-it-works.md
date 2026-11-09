@@ -45,6 +45,47 @@ output for a package without commands is successful. Multiple-package failures
 are accumulated into a nonzero final status. Integration checks:
 `python3 -m unittest discover -s tests -v` (configured host/containers required).
 
+## Update/upgrade separation
+
+`cmd_upgrade` retains the original sequential mutating operations. `cmd_update`
+only refreshes metadata and queries candidates, one background job per reachable
+world, each with separate stdout/stderr files and a checked exit status:
+
+- DNF: unprivileged `dnf -q --refresh --setopt=skip_if_unavailable=False repoquery
+  --upgrades --latest-limit=1`, name.arch + EVR output, unique name.arch count.
+- Arch: container-local Bash creates a temporary database, symlinks its `local`
+  entry to `/var/lib/pacman/local`, refreshes **only the temporary sync database**
+  with `fakeroot pacman -Sy --dbpath ... --logfile /dev/null`, queries `pacman -Qu`
+  there, then `yay -Qua` for AUR. Empty output/exit 1 from these queries is normal
+  only without error diagnostics. The temporary database is removed on exit;
+  the live sync database never advances, avoiding partial-upgrade hazards.
+- Ubuntu: `sudo -n apt-get -o APT::Update::Error-Mode=any update` inside the container,
+  then `apt list --upgradable`, stripping the header/repository suffix. No upgrades.
+- Flatpak: host-only `flatpak remote-ls --updates --all --arch='*' --columns=ref`; count unique refs,
+  including runtimes and branches, not just apps.
+
+Modes: default grouped list, `--count` total, `--counts` four space-separated
+numbers in DNF/Arch/Ubuntu/Flatpak order, or `--json` one object with `checked_at`
+(epoch seconds), `ok`, `total` (known subtotal if failed), `counts`, `status`.
+Unavailable worlds have zero count and `unavailable` status; failed worlds have
+null count and `error`. Any failure exits 1 and suppresses numeric output rather
+than inventing zeros. Candidate counts are not final solver transaction sizes.
+
+The optional `bin/pkg-updates` Python bridge persists atomic JSON under
+`~/.cache/pkg/updates.json`, serializes concurrent checks/upgrades with flock,
+posts notifications on successful positive checks and launches the identical
+upgrade action in Konsole. Even failed upgrades trigger a new check. Ordinary
+overlapping checks skip; post-upgrade checks wait for the check lock and then
+refresh, so an older background check cannot leave pre-upgrade counts behind. The user
+systemd timer checks every 24/48 hours and at startup; the plasmoid polls only
+cached state. Resetting `OnUnitActiveSec=` clears **all** monotonic timer triggers,
+so the scheduling drop-in must also reinstate `OnStartupSec=10min`.
+
+`install-updates.sh` is an optional separate installer: it deploys pkg, its bridge,
+the plasmoid and user units without package installs, enables the timer and starts
+a fresh asynchronous check. No running applet reloads its QML just because files
+changed; recreate its panel instance or restart the owning plasmashell unit.
+
 ## Data sources
 
 | List | Command | Size | Cost |
@@ -142,10 +183,10 @@ that cost, and the parallel refresh overlaps the cold starts rather than adding 
 up. When a container is unreachable, degrade with a warning instead of failing the
 whole command.
 
-One step is deliberately host-only: the `flatpak update` in `pkg update`. Both
+One step is deliberately host-only: the `flatpak update` in `pkg upgrade`. Both
 containers ship their own flatpak with their own system installation, so running it
 there would update something other than the user's desktop apps; inside a container
-`pkg update` prints `skipping Flatpaks — host-side only`.
+`pkg upgrade` prints `skipping Flatpaks — host-side only`.
 
 ## Refreshing the lists in parallel
 

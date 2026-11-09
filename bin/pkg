@@ -13,7 +13,7 @@
 #
 # Interactive (fzf TUI):   install, remove
 # Scriptable (priority Fedora -> Arch/yay -> Ubuntu, available worlds only):
-#   add, drop, search, info, update, autoremove, clean, present, missing,
+#   add, drop, search, info, update, upgrade, autoremove, clean, present, missing,
 #   list, refresh
 #
 # Env knobs:
@@ -1073,7 +1073,105 @@ cmd_contains() {
   return "$rc"
 }
 
-cmd_update() {
+# Read-only upgrade candidates. Arch uses a disposable sync database: refreshing
+# /var/lib/pacman/sync here would enable accidental partial upgrades later.
+update_candidates() {
+  case "$1" in
+    dnf) dnf -q --refresh --setopt=skip_if_unavailable=False repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch} %{evr}\n' ;;
+    arch) in_arch bash -c '
+      set -uo pipefail
+      db=$(mktemp -d) || exit 1
+      trap '\''rm -rf "$db"'\'' EXIT
+      ln -s /var/lib/pacman/local "$db/local" || exit 1
+      fakeroot pacman -Sy --dbpath "$db" --logfile /dev/null >&2 || exit 1
+      pacman -Qu --dbpath "$db" > "$db/repo" 2> "$db/error"
+      rc=$?
+      if (( rc > 1 )) || { (( rc == 1 )) && [[ -s $db/error ]]; }; then cat "$db/error" >&2; exit 1; fi
+      cat "$db/repo"
+      yay -Qua > "$db/aur" 2> "$db/error"
+      rc=$?
+      if (( rc > 1 )) || { (( rc == 1 )) && [[ -s $db/error ]]; }; then cat "$db/error" >&2; exit 1; fi
+      cat "$db/error" >&2
+      cat "$db/aur"
+    ' ;;
+    ubuntu)
+      in_ubuntu sudo -n apt-get -o APT::Update::Error-Mode=any update >&2 || return 1
+      in_ubuntu apt list --upgradable 2>/dev/null |
+        awk '/\[upgradable from:/ { sub(/\/.*/, "", $1); print $1, $2 }' ;;
+    flatpak) flatpak remote-ls --updates --all --arch='*' --columns=ref ;;
+  esac
+}
+
+cmd_update() (
+  local mode=list a w rc=0 total=0 n available
+  for a in "$@"; do
+    case "$a" in
+      --count|--counts|--json) [[ $mode == list ]] || { err "choose one update output mode"; return 1; }; mode=${a#--} ;;
+      *) err "usage: pkg update [--count|--counts|--json]"; return 1 ;;
+    esac
+  done
+  local tmp
+  tmp=$(mktemp -d) || return 1
+  trap 'rm -rf "$tmp"' EXIT
+  local -A pids=() counts=() statuses=()
+  for w in dnf arch ubuntu flatpak; do
+    available=0
+    case "$w" in
+      dnf) has_fedora && available=1 ;;
+      arch) has_arch && available=1 ;;
+      ubuntu) has_apt && available=1 ;;
+      flatpak) [[ -z $HERE ]] && host_cmd flatpak && available=1 ;;
+    esac
+    counts[$w]=0; statuses[$w]=unavailable
+    (( available )) || continue
+    statuses[$w]=ok
+    update_candidates "$w" > "$tmp/$w.raw" 2> "$tmp/$w.err" &
+    pids[$w]=$!
+  done
+  for w in dnf arch ubuntu flatpak; do
+    [[ -v pids[$w] ]] || continue
+    if wait "${pids[$w]}"; then
+      # Count unique package identities (DNF includes architecture; Flatpak full
+      # refs include app/runtime, architecture and branch), not duplicate repos.
+      awk 'NF && !seen[$1]++' "$tmp/$w.raw" > "$tmp/$w"
+      n=$(awk 'END { print NR+0 }' "$tmp/$w")
+      counts[$w]=$n; total=$((total + n))
+    else
+      statuses[$w]=error; counts[$w]=null; rc=1
+      err "$w: update check failed"
+      cat "$tmp/$w.err" >&2
+    fi
+  done
+  # A failed check must never masquerade as zero updates in a numeric consumer.
+  case "$mode" in
+    count) (( rc )) || printf '%s\n' "$total" ;;
+    counts) (( rc )) || printf '%s %s %s %s\n' "${counts[dnf]}" "${counts[arch]}" "${counts[ubuntu]}" "${counts[flatpak]}" ;;
+    json)
+      printf '{"checked_at":%s,"ok":%s,"total":%s,"counts":{' "$(date +%s)" "$([[ $rc == 0 ]] && echo true || echo false)" "$total"
+      local sep=""
+      for w in dnf arch ubuntu flatpak; do printf '%s"%s":%s' "$sep" "$w" "${counts[$w]}"; sep=,; done
+      printf '},"status":{'; sep=""
+      for w in dnf arch ubuntu flatpak; do printf '%s"%s":"%s"' "$sep" "$w" "${statuses[$w]}"; sep=,; done
+      printf '}}\n' ;;
+    list)
+      for w in dnf arch ubuntu flatpak; do
+        printf '=== %s: ' "$w"
+        case "${statuses[$w]}" in
+          unavailable) printf 'not available here ===\n' ;;
+          error) printf 'check failed ===\n' ;;
+          ok) printf '%s update(s) ===\n' "${counts[$w]}"; cat "$tmp/$w" ;;
+        esac
+      done
+      printf 'Total: %s%s\n' "$total" "$([[ $rc == 0 ]] || echo ' (incomplete; check failed)')" ;;
+  esac
+  return "$rc"
+)
+
+cmd_upgrade() {
+  local a
+  for a in "$@"; do
+    case "$a" in -n|--dry-run) DRY_RUN=1 ;; *) err "usage: pkg upgrade [-n|--dry-run]"; return 1 ;; esac
+  done
   local rc=0
   if has_fedora; then
     info "updating Fedora (dnf)"
@@ -1270,7 +1368,11 @@ Scriptable — Fedora is tried first, yay second, apt last
   pkg search <term>...        dnf search + yay -Ss + apt-cache search
   pkg info [-a] <pkg>...      dnf info, else pacman -Sii, else yay -Siia, else apt-cache show
   pkg contains [--all] <pkg>... command names; --all lists every file (Fedora -> Arch -> Ubuntu)
-  pkg update                  dnf upgrade --refresh + yay -Syu + apt update&upgrade + flatpak update
+  pkg update                  check fresh upgrade candidates; print packages, install nothing
+  pkg update --count          total count only (one number)
+  pkg update --counts         DNF Arch/AUR Ubuntu Flatpak counts only (four numbers)
+  pkg update --json           counts/status/timestamp JSON for widgets and scripts
+  pkg upgrade [-n]            dnf upgrade --refresh + yay -Syu + apt update&upgrade + flatpak update
   pkg autoremove              dnf autoremove + yay -Yc + apt autoremove --purge (orphans)
   pkg clean                   dnf clean all + yay -Scc + apt clean
   pkg present <pkgs...>       exit 0 if all installed  (script predicate)
@@ -1308,7 +1410,7 @@ Notes
   dnf and the Arch world are reported as skipped, never attempted, so there is
   no "dnf: command not found". Inside the Arch container it is pacman/yay alone.
   -n/--dry-run or PKG_DRY_RUN=1 prints commands instead of running them.
-  --json prints JSON Lines: one {"source","name","installed"} object per line.
+  list --json prints JSON Lines; update --json prints one counts/status object.
   Lists live in ~/.cache/pkg (PKG_CACHE_TTL seconds, default 24 h); preview
   info is cached too (PKG_INFO_TTL, disable with PKG_NO_INFO_CACHE=1).
   Containers are named Arch / Ubuntu (PKG_CONTAINER / PKG_UBUNTU_CONTAINER).
@@ -1328,7 +1430,8 @@ case "${1:-help}" in
   search|find)    shift; cmd_search "$@" ;;
   info|show)      shift; cmd_info "$@" ;;
   contains)       shift; cmd_contains "$@" ;;
-  update|upgrade) shift; cmd_update "$@" ;;
+  update)         shift; cmd_update "$@" ;;
+  upgrade)        shift; cmd_upgrade "$@" ;;
   autoremove)     shift; cmd_autoremove "$@" ;;
   clean)          shift; cmd_clean "$@" ;;
   present)        shift; cmd_present "$@" ;;

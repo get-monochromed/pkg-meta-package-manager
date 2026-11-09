@@ -103,9 +103,12 @@ pkg drop [-n] <pkgs...>      remove what is installed, ignore the rest
 pkg search <term>...         dnf search + yay -Ss + apt-cache search
 pkg info [-a] <pkg>...       dnf info, else pacman -Sii, else yay -Siia, else apt-cache show
 pkg contains [--all] <pkg>... command names, or every file with --all
-pkg update                   dnf upgrade --refresh + yay -Syu + apt update/upgrade + flatpak update
-                             (worlds that are not reachable, and the Flatpak step
-                             inside a container, are skipped with a note)
+pkg update                   check fresh upgrade candidates; print packages, install nothing
+pkg update --count           one total number, nothing else on stdout
+pkg update --counts          four numbers: DNF Arch/AUR Ubuntu Flatpak
+pkg update --json            one JSON object with counts, status, total and checked_at
+pkg upgrade [-n]             dnf upgrade --refresh + yay -Syu + apt update/upgrade + flatpak update
+                             (unreachable worlds and container-side Flatpak are skipped)
 pkg autoremove               dnf autoremove + yay -Yc + apt autoremove --purge
 pkg clean                    dnf clean all + yay -Scc + apt clean
 pkg present <pkgs...>        exit 0 if all are installed   (predicate)
@@ -119,6 +122,75 @@ pkg help
 
 `-n` / `PKG_DRY_RUN=1` prints the commands instead of running them, which is how
 routing gets tested without side effects.
+
+## Update checks and the Plasma notifier
+
+`update` and `upgrade` are deliberately different: **`pkg update` never installs
+packages**, while **`pkg upgrade` upgrades all reachable worlds**. Checks refresh
+metadata (including `apt-get update` using passwordless container sudo). Arch
+checks use a disposable sync database, never the live pacman sync database, and
+include AUR packages. `fakeroot` is provided by the Arch base-devel toolchain.
+
+```bash
+pkg update                  # names and candidate versions, grouped by source
+pkg update --count          # e.g. 14
+pkg update --counts         # e.g. 5 3 2 4 — DNF, Arch/AUR, Ubuntu, Flatpak
+pkg update --json           # machine-readable status and counts
+pkg upgrade                 # actually install the upgrades
+pkg upgrade -n              # print upgrade commands only
+```
+
+The example numbers above are illustrative. Counts are upgrade candidates, not a
+solver's final transaction size: dependencies, held packages, replacements and
+install-only kernels can change what the upgrade transaction does. DNF counts
+name+architecture; Arch includes repo and AUR packages; Ubuntu counts upgradable
+packages; Flatpak counts full refs (apps **and runtimes**, including extensions,
+branches and installed architectures).
+Unavailable worlds count as zero with `status: "unavailable"` in JSON. A failed
+check exits 1, emits diagnostics on stderr, and produces **no numeric stdout**;
+JSON still returns partial results with `ok: false` and `null` for failed counts.
+
+Install the optional Plasma 6 panel widget without reinstalling dependencies:
+
+```bash
+./install-updates.sh
+```
+
+Add **pkg Updates** to a panel. It shows an update icon followed by four counts,
+always in **DNF / Arch+AUR / Ubuntu / Flatpak** order. Hover for labels and the
+last check time. Unknown/failed counts show `?`; unavailable sources show `–`.
+
+- **Left-click:** open Konsole, run `pkg upgrade`, refresh counts afterwards.
+  Konsole stays open so errors and the upgrade output remain readable.
+- **Middle-click / right-click → Check for updates now:** fresh background check.
+- **Right-click → Check every day / every two days:** choose 24 or 48 hours.
+- Successful scheduled checks with updates post a desktop notification.
+- The panel only polls cached JSON every 15 seconds; it does not run package
+  managers every 15 seconds. A systemd **user timer** checks daily by default,
+  and 10 minutes after the user manager starts (typically login). Missed running
+  intervals are checked after resume. There are **no automatic upgrades**.
+
+Headless/debugging interface (same actions used by the widget):
+
+```bash
+pkg-updates state                  # ~/.cache/pkg/updates.json, no network
+pkg-updates check --no-notify      # fresh check + atomic cached state
+pkg-updates launch --dry-run       # JSON argv of the real click action
+pkg-updates schedule --hours 48    # or 24
+systemctl --user status pkg-updates.timer
+journalctl --user -u pkg-updates.service
+```
+
+`pkg-updates --state-file /path/to/test.json ...` isolates state for tests;
+`PKG_UPDATES_PKG=/path/to/pkg` selects a test backend. For UI simulation, back up
+the cached JSON and replace its `counts`, `total` and `status` with a fixture;
+the widget updates on its next poll. Restore the real state afterwards. These
+are test inputs, not live package results.
+
+To disable checks: `systemctl --user disable --now pkg-updates.timer`. Remove the
+widget through Plasma's panel editor. Widget code is in `plasmoid/`, timer units
+in `systemd/`, and its standard-library Python bridge in `bin/pkg-updates`; the
+main `bin/pkg` command remains a self-contained Bash script.
 
 ## Package contents
 

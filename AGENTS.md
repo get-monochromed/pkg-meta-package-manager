@@ -9,7 +9,7 @@
 | Ubuntu container (distrobox) | `apt` / `dpkg` | `apt/` |
 
 Interactive fzf TUIs (`pkg install`, `pkg remove`) plus scriptable subcommands
-(`add`, `drop`, `search`, `info`, `update`, `autoremove`, `clean`, `present`, `missing`,
+(`add`, `drop`, `search`, `info`, `update`, `upgrade`, `autoremove`, `clean`, `present`, `missing`,
 `list`, `export`, `unexport`, `refresh`). This is a personal tool for *this* machine
 (Fedora host + containers named `Arch` and `Ubuntu`) — not a portable cross-distro
 abstraction. `docs/how-it-works.md` is the design document; read it before touching
@@ -52,11 +52,15 @@ routing or detection.
   The AUR list is diffed against a freshly fetched repo list so repo packages are not
   double-listed.
 - **Style:** single file, bash, `set -uo pipefail` (no `-e` — most calls are expected to
-  fail), `LC_ALL=C`, no new dependencies outside dnf/pacman/yay/apt/fzf. Helpers that
+  fail), `LC_ALL=C`; the core uses package-manager tooling plus fakeroot from Arch
+  base-devel. The optional widget bridge uses system Python's standard library,
+  systemd user units, notify-send and Plasma's executable data engine. Helpers that
   answer a yes/no question must end with an explicit `return 0`/`return 1`: a trailing
   `[[ … ]] && return 1` returns 1 on the good path too.
-- **No secrets, no writes outside `~/.cache/pkg`, `~/.local/bin`, `~/.local/share/applications`
-  and the three package managers.** Container sudo is passwordless; **host** sudo needs a
+- **No secrets.** The optional notifier also writes its plasmoid under
+  `~/.local/share/plasma/plasmoids/com.monochrome.pkgupdates` and systemd user units
+  under `~/.config/systemd/user/pkg-updates.*`. Otherwise writes stay within
+  `~/.cache/pkg`, `~/.local/bin`, `~/.local/share/applications` and the package managers. Container sudo is passwordless; **host** sudo needs a
   real TTY — an agent-driven shell cannot borrow the user's timestamp. Run host-side
   installs in Konsole and let the user type the password.
 
