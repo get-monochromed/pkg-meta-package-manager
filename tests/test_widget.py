@@ -80,7 +80,7 @@ echo '{"ok":true,"total":0,"counts":{"dnf":0,"arch":0,"ubuntu":0,"flatpak":0},"s
             self.assertEqual(p.returncode, 1)
             self.assertIn('==> upgrading Fedora (dnf)', p.stdout)
             self.assertIn('sudo: a password is required', p.stdout)  # merged, so visible
-            log = (Path.home() / '.cache/pkg/upgrade.log').read_text()
+            log = (d / 'upgrade.log').read_text()  # next to the isolated state file
             self.assertIn('=== pkg upgrade', log)
             self.assertIn('pkg upgrade failed with status 1', p.stderr)
 

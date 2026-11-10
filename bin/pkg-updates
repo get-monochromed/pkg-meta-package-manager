@@ -21,7 +21,10 @@ def initial():
                 problems={})
 
 
-LOG = CACHE / 'upgrade.log'
+def log_path(state):
+    # next to the state file, so an isolated --state-file cannot scribble on the
+    # user's real upgrade log (and tests stay self-contained)
+    return state.with_name('upgrade.log')
 
 
 def classify(data):
@@ -126,8 +129,9 @@ def main():
                 return 1
             # Tee the whole attempt to a log: a window that scrolls away used to
             # leave no evidence of what actually failed.
-            LOG.parent.mkdir(parents=True, exist_ok=True)
-            with LOG.open('a') as log:
+            log_file = log_path(args.state_file)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with log_file.open('a') as log:
                 log.write(f'\n=== pkg upgrade {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
                 log.flush()
                 proc = subprocess.Popen([PKG, 'upgrade'], stdout=subprocess.PIPE,
@@ -140,7 +144,8 @@ def main():
                     log.flush()
                 result = proc.wait()
             if result != 0:
-                print(f'\n(pkg upgrade failed with status {result}; log: {LOG})', file=sys.stderr)
+                print(f'\n(pkg upgrade failed with status {result}; log: {log_file})',
+                      file=sys.stderr)
             check(args.state_file, notify=False, wait=True)
             return result
     if args.command == 'schedule':
