@@ -100,6 +100,20 @@ nothing is installed on the host. Both recipes are in `docs/how-it-works.md`
 - JSON emitters must end every format string with `\n` — JSON Lines, one object per line.
 - `yay -Rns` and `apt-get autoremove` remove pulled-in dependencies; removing one package
   can drop a dep another app merely optionally needs.
+- **`timeout` cannot wrap a shell function.** `timeout 180 in_ubuntu apt-get …` fails
+  with "failed to run command 'in_ubuntu'"; put the timeout *inside* the wrapper
+  (`in_ubuntu timeout 180 …`).
+- **A background helper must not inherit the caller's stdout**, and an EXIT trap
+  must not read a function-local: `( while sleep 30; do …; done ) >/dev/null 2>&1 &`
+  with a global `_PKG_KEEPALIVE` — otherwise a tee'ing caller waits forever for EOF
+  and `set -u` turns the trap into "line 1: keepalive: unbound variable".
+- **Never refresh apt metadata on every check.** A mirror caught mid-sync (404 /
+  "File has unexpected size") made each check take minutes, held
+  `/var/lib/apt/lists/lock`, and turned the whole check into an error. Gate the
+  refresh on index age and fall back to the cache with a `stale` status.
+- **A single failing source is degradation, not failure.** Only "nothing could be
+  checked" may raise the widget's alarm; otherwise one dead mirror hides 26 real
+  updates behind a warning triangle (and suppresses the notification).
 - `in_cont_each` payloads are single-quoted on purpose so the *container's* bash expands
   `"$@"`. shellcheck flags them (SC2016); that is intended.
 

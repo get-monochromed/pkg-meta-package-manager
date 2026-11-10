@@ -16,8 +16,25 @@ WORLDS = ('dnf', 'arch', 'ubuntu', 'flatpak')
 
 
 def initial():
-    return dict(ok=False, checked_at=None, total=0,
-                counts=dict.fromkeys(WORLDS), status=dict.fromkeys(WORLDS, 'unknown'))
+    return dict(ok=False, degraded=False, alarm=True, checked_at=None, total=0,
+                counts=dict.fromkeys(WORLDS), status=dict.fromkeys(WORLDS, 'unknown'),
+                problems={})
+
+
+LOG = CACHE / 'upgrade.log'
+
+
+def classify(data):
+    """Was the whole check broken, or just one source?
+
+    The panel must not scream because a single mirror is mid-sync: alarm only
+    when nothing could be checked at all (or the helper itself blew up).
+    """
+    data['degraded'] = data.get('degraded') is True
+    data['ok'] = data.get('ok') is True
+    data['alarm'] = not data['ok'] and not data['degraded']
+    data.setdefault('problems', {})
+    return data
 
 
 def read_state(path):
@@ -51,12 +68,17 @@ def check(path, notify=True, wait=False):
             data['ok'] = data['ok'] is True and result.returncode == 0
             if result.stderr.strip():
                 data['error'] = result.stderr.strip()[-3000:]
+            classify(data)
         except (OSError, ValueError, KeyError, AssertionError, subprocess.TimeoutExpired) as exc:
             data = initial() | dict(checked_at=int(time.time()), error=str(exc))
+            classify(data)
         save_state(path, data)
-        if notify and data['ok'] and data['total'] > 0:
-            text = ' · '.join(f'{label}: {data["counts"][w]}' for w, label in
-                              zip(WORLDS, ('DNF', 'Arch/AUR', 'Ubuntu', 'Flatpak')))
+        # Notify when there are usable counts, even if one source is degraded:
+        # 26 DNF updates still matter while Ubuntu's mirror is down.
+        if notify and not data['alarm'] and data['total'] > 0:
+            text = ' · '.join(
+                f'{label}: {data["counts"][w] if data["counts"][w] is not None else "?"}'
+                for w, label in zip(WORLDS, ('DNF', 'Arch/AUR', 'Ubuntu', 'Flatpak')))
             try:
                 subprocess.run(['notify-send', '-a', 'pkg', '-i', 'system-software-update',
                                 f'{data["total"]} package updates available',
@@ -76,7 +98,7 @@ def main():
     sub.add_parser('state', help='print cached JSON, no package manager calls')
     p = sub.add_parser('launch', help='open the exact widget upgrade action in Konsole')
     p.add_argument('--dry-run', action='store_true', help='print argv as JSON without opening a terminal')
-    sub.add_parser('upgrade', help='run pkg upgrade, then refresh the widget counts')
+    sub.add_parser('upgrade', help='run pkg upgrade (logged), then refresh the counts')
     p = sub.add_parser('schedule', help='set the systemd user timer interval')
     p.add_argument('--hours', type=int, choices=(24, 48), required=True)
     args = parser.parse_args()
@@ -102,9 +124,25 @@ def main():
             except BlockingIOError:
                 print('pkg upgrade is already running.', file=sys.stderr)
                 return 1
-            result = subprocess.run([PKG, 'upgrade'])
+            # Tee the whole attempt to a log: a window that scrolls away used to
+            # leave no evidence of what actually failed.
+            LOG.parent.mkdir(parents=True, exist_ok=True)
+            with LOG.open('a') as log:
+                log.write(f'\n=== pkg upgrade {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
+                log.flush()
+                proc = subprocess.Popen([PKG, 'upgrade'], stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    log.write(line)
+                    log.flush()
+                result = proc.wait()
+            if result != 0:
+                print(f'\n(pkg upgrade failed with status {result}; log: {LOG})', file=sys.stderr)
             check(args.state_file, notify=False, wait=True)
-            return result.returncode
+            return result
     if args.command == 'schedule':
         config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
         dropin = config / 'systemd/user/pkg-updates.timer.d/interval.conf'

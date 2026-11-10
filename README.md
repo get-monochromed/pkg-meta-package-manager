@@ -146,9 +146,19 @@ install-only kernels can change what the upgrade transaction does. DNF counts
 name+architecture; Arch includes repo and AUR packages; Ubuntu counts upgradable
 packages; Flatpak counts full refs (apps **and runtimes**, including extensions,
 branches and installed architectures).
-Unavailable worlds count as zero with `status: "unavailable"` in JSON. A failed
-check exits 1, emits diagnostics on stderr, and produces **no numeric stdout**;
-JSON still returns partial results with `ok: false` and `null` for failed counts.
+
+**One broken source never hides the others.** `--counts` prints `?` for a source
+that could not be queried, `--count` prints the known subtotal, and both exit 1 so
+scripts can tell. JSON keeps `counts` (`null` for unknown), `status`
+(`ok` / `stale` / `error` / `unavailable`), `problems` (the first error line per
+source), plus `ok` (everything was checked) and `degraded` (something was checked,
+something was not). A refresh that fails falls back to the last good metadata and
+reports `stale` instead of pretending there are zero updates.
+
+Metadata refreshes are bounded: the container's `apt-get update` runs at most
+every `PKG_APT_CHECK_HOURS` (6) hours — refreshing on every check hammered a
+mirror that was mid-sync for minutes and left apt's lock behind — and each source
+has a timeout (`PKG_CHECK_TIMEOUT_{DNF,ARCH,APT,FLATPAK}`).
 
 Install the optional Plasma 6 panel widget without reinstalling dependencies:
 
@@ -160,11 +170,17 @@ Add **pkg Updates** to a panel. It shows an update icon followed by four counts,
 always in **DNF / Arch+AUR / Ubuntu / Flatpak** order. Hover for labels and the
 last check time. Unknown/failed counts show `?`; unavailable sources show `–`.
 
-- **Left-click:** open Konsole, run `pkg upgrade`, refresh counts afterwards.
-  Konsole stays open so errors and the upgrade output remain readable.
+- **Left-click:** open Konsole and run `pkg upgrade`. The window starts with an
+  **AUTHENTICATE NOW** banner and runs `sudo -v` first, so the fingerprint/password
+  prompt appears before anything else (sudo here uses fingerprint PAM, and a
+  missed prompt used to look exactly like "there is nothing to upgrade"). The
+  attempt is logged to `~/.cache/pkg/upgrade.log`, and the window ends with a
+  per-source summary — `upgraded: dnf=ok arch=ok …` or `FAILED: dnf=FAILED …`.
 - **Middle-click / right-click → Check for updates now:** fresh background check.
 - **Right-click → Check every day / every two days:** choose 24 or 48 hours.
-- Successful scheduled checks with updates post a desktop notification.
+- A scheduled check with updates posts a desktop notification, including when one
+  source is degraded (it shows that source as `?`). The warning icon appears only
+  when *nothing* could be checked.
 - The panel only polls cached JSON every 15 seconds; it does not run package
   managers every 15 seconds. A systemd **user timer** checks daily by default,
   and 10 minutes after the user manager starts (typically login). Missed running

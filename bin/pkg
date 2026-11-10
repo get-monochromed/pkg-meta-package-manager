@@ -1075,10 +1075,39 @@ cmd_contains() {
 
 # Read-only upgrade candidates. Arch uses a disposable sync database: refreshing
 # /var/lib/pacman/sync here would enable accidental partial upgrades later.
+#
+# Exit status tells the caller how much to trust the numbers it printed:
+#   0  fresh metadata, complete list
+#   2  metadata refresh failed, list is from the last good cache (stale)
+#   1  no usable list
+CHECK_TIMEOUT_DNF="$(num_or "${PKG_CHECK_TIMEOUT_DNF:-180}" 180)"
+CHECK_TIMEOUT_ARCH="$(num_or "${PKG_CHECK_TIMEOUT_ARCH:-300}" 300)"
+CHECK_TIMEOUT_APT="$(num_or "${PKG_CHECK_TIMEOUT_APT:-180}" 180)"
+CHECK_TIMEOUT_FLATPAK="$(num_or "${PKG_CHECK_TIMEOUT_FLATPAK:-90}" 90)"
+APT_CHECK_HOURS="$(num_or "${PKG_APT_CHECK_HOURS:-6}" 6)"
+
+apt_lists_age_hours() {  # empty when there is no usable index
+  in_ubuntu bash -c 'f=$(ls -t /var/lib/apt/lists/*_Packages* 2>/dev/null | head -1); [[ -n $f ]] && echo $(( ($(date +%s) - $(stat -c %Y "$f")) / 3600 ))'
+}
+apt_upgradable() {
+  in_ubuntu apt list --upgradable 2>/dev/null |
+    awk '/\[upgradable from:/ { sub(/\/.*/, "", $1); print $1, $2 }'
+}
+
 update_candidates() {
   case "$1" in
-    dnf) dnf -q --refresh --setopt=skip_if_unavailable=False repoquery --upgrades --latest-limit=1 --qf '%{name}.%{arch} %{evr}\n' ;;
-    arch) in_arch bash -c '
+    dnf)
+      timeout "$CHECK_TIMEOUT_DNF" dnf -q --refresh repoquery --upgrades \
+        --latest-limit=1 --qf '%{name}.%{arch} %{evr}\n' && return 0
+      # A refresh that fails (offline, one dead repo) must not throw away a
+      # usable cache: count from it and say the result is stale.
+      timeout "$CHECK_TIMEOUT_DNF" dnf -q repoquery --upgrades \
+        --latest-limit=1 --qf '%{name}.%{arch} %{evr}\n' >/dev/null 2>&1 &&
+        { warn "dnf: metadata refresh failed — counting from the cached metadata"
+          timeout "$CHECK_TIMEOUT_DNF" dnf -q repoquery --upgrades \
+            --latest-limit=1 --qf '%{name}.%{arch} %{evr}\n'; return 2; }
+      return 1 ;;
+    arch) in_arch timeout "$CHECK_TIMEOUT_ARCH" bash -c '
       set -uo pipefail
       db=$(mktemp -d) || exit 1
       trap '\''rm -rf "$db"'\'' EXIT
@@ -1095,15 +1124,29 @@ update_candidates() {
       cat "$db/aur"
     ' ;;
     ubuntu)
-      in_ubuntu sudo -n apt-get -o APT::Update::Error-Mode=any update >&2 || return 1
-      in_ubuntu apt list --upgradable 2>/dev/null |
-        awk '/\[upgradable from:/ { sub(/\/.*/, "", $1); print $1, $2 }' ;;
-    flatpak) flatpak remote-ls --updates --all --arch='*' --columns=ref ;;
+      # Refreshing the index on every check hammered a mirror that was mid-sync
+      # for minutes at a time and left apt's lock behind. Refresh at most every
+      # APT_CHECK_HOURS; on failure fall back to the last good index.
+      local age rc stale=0
+      age="$(apt_lists_age_hours)"
+      if [[ -n ${age:-} ]] && (( age < APT_CHECK_HOURS )); then
+        :
+      elif in_ubuntu timeout "$CHECK_TIMEOUT_APT" sudo -n env DEBIAN_FRONTEND=noninteractive \
+             apt-get -o Acquire::Retries=1 update >&2; then
+        :
+      else
+        stale=1
+        warn "ubuntu: package index refresh failed — counting from the last good index"
+      fi
+      apt_upgradable || { (( stale )) && return 2; return 1; }
+      (( stale )) && return 2
+      return 0 ;;
+    flatpak) timeout "$CHECK_TIMEOUT_FLATPAK" flatpak remote-ls --updates --all --arch='*' --columns=ref ;;
   esac
 }
 
 cmd_update() (
-  local mode=list a w rc=0 total=0 n available
+  local mode=list a w rc=0 total=0 n available run_rc usable=0 degraded=0
   for a in "$@"; do
     case "$a" in
       --count|--counts|--json) [[ $mode == list ]] || { err "choose one update output mode"; return 1; }; mode=${a#--} ;;
@@ -1114,6 +1157,7 @@ cmd_update() (
   tmp=$(mktemp -d) || return 1
   trap 'rm -rf "$tmp"' EXIT
   local -A pids=() counts=() statuses=()
+  local -a problems=()
   for w in dnf arch ubuntu flatpak; do
     available=0
     case "$w" in
@@ -1130,42 +1174,64 @@ cmd_update() (
   done
   for w in dnf arch ubuntu flatpak; do
     [[ -v pids[$w] ]] || continue
-    if wait "${pids[$w]}"; then
-      # Count unique package identities (DNF includes architecture; Flatpak full
-      # refs include app/runtime, architecture and branch), not duplicate repos.
-      awk 'NF && !seen[$1]++' "$tmp/$w.raw" > "$tmp/$w"
-      n=$(awk 'END { print NR+0 }' "$tmp/$w")
-      counts[$w]=$n; total=$((total + n))
-    else
-      statuses[$w]=error; counts[$w]=null; rc=1
-      err "$w: update check failed"
-      cat "$tmp/$w.err" >&2
-    fi
+    run_rc=0
+    wait "${pids[$w]}" || run_rc=$?
+    case "$run_rc" in
+      0|2)
+        # Count unique package identities (DNF includes architecture; Flatpak full
+        # refs include app/runtime, architecture and branch), not duplicate repos.
+        awk 'NF && !seen[$1]++' "$tmp/$w.raw" > "$tmp/$w"
+        n=$(awk 'END { print NR+0 }' "$tmp/$w")
+        counts[$w]=$n; total=$((total + n))
+        usable=$((usable + 1))
+        if (( run_rc == 2 )); then
+          statuses[$w]=stale; degraded=1; rc=1
+          problems+=("$w|$(head -c 400 "$tmp/$w.err" | tr '\n' ' ')")
+        fi ;;
+      *)
+        statuses[$w]=error; counts[$w]=null; rc=1
+        problems+=("$w|$(head -c 400 "$tmp/$w.err" | tr '\n' ' ')")
+        err "$w: update check failed"
+        cat "$tmp/$w.err" >&2 ;;
+    esac
   done
-  # A failed check must never masquerade as zero updates in a numeric consumer.
+  # A failing world is degradation when the others still produced numbers, and a
+  # real failure (the widget must shout) when nothing could be checked at all.
+  if (( usable && rc )); then degraded=1; else degraded=0; fi
   case "$mode" in
-    count) (( rc )) || printf '%s\n' "$total" ;;
-    counts) (( rc )) || printf '%s %s %s %s\n' "${counts[dnf]}" "${counts[arch]}" "${counts[ubuntu]}" "${counts[flatpak]}" ;;
+    count) printf '%s\n' "$total" ;;
+    counts) printf '%s %s %s %s\n' "${counts[dnf]//null/?}" "${counts[arch]//null/?}" \
+              "${counts[ubuntu]//null/?}" "${counts[flatpak]//null/?}" ;;
     json)
-      printf '{"checked_at":%s,"ok":%s,"total":%s,"counts":{' "$(date +%s)" "$([[ $rc == 0 ]] && echo true || echo false)" "$total"
+      printf '{"checked_at":%s,"ok":%s,"degraded":%s,"total":%s,"counts":{' \
+        "$(date +%s)" "$([[ $rc == 0 ]] && echo true || echo false)" \
+        "$([[ $degraded == 1 ]] && echo true || echo false)" "$total"
       local sep=""
       for w in dnf arch ubuntu flatpak; do printf '%s"%s":%s' "$sep" "$w" "${counts[$w]}"; sep=,; done
       printf '},"status":{'; sep=""
       for w in dnf arch ubuntu flatpak; do printf '%s"%s":"%s"' "$sep" "$w" "${statuses[$w]}"; sep=,; done
+      printf '},"problems":{'; sep=""
+      local entry
+      for entry in "${problems[@]:-}"; do
+        [[ -n $entry ]] || continue
+        printf '%s"%s":"%s"' "$sep" "${entry%%|*}" "$(printf '%s' "${entry#*|}" | sed 's/[\\"]/ /g')"; sep=,
+      done
       printf '}}\n' ;;
     list)
       for w in dnf arch ubuntu flatpak; do
         printf '=== %s: ' "$w"
         case "${statuses[$w]}" in
           unavailable) printf 'not available here ===\n' ;;
-          error) printf 'check failed ===\n' ;;
+          error) printf 'check failed ===\n'; sed 's/^/    /' "$tmp/$w.err" ;;
+          stale) printf '%s update(s), from a stale cache ===\n' "${counts[$w]}"; cat "$tmp/$w" ;;
           ok) printf '%s update(s) ===\n' "${counts[$w]}"; cat "$tmp/$w" ;;
         esac
       done
-      printf 'Total: %s%s\n' "$total" "$([[ $rc == 0 ]] || echo ' (incomplete; check failed)')" ;;
+      printf 'Total: %s%s\n' "$total" "$([[ $rc == 0 ]] || echo ' (incomplete — see the failed sources above)')" ;;
   esac
   return "$rc"
 )
+
 
 cmd_upgrade() {
   local a
@@ -1173,22 +1239,58 @@ cmd_upgrade() {
     case "$a" in -n|--dry-run) DRY_RUN=1 ;; *) err "usage: pkg upgrade [-n|--dry-run]"; return 1 ;; esac
   done
   local rc=0
+  local dnf_state=skipped arch_state=skipped ubuntu_state=skipped flatpak_state=skipped
+
+  # Authenticate ONCE, up front, visibly. Fedora and both containers upgrade
+  # through sudo; when this runs in a terminal opened by the panel widget the
+  # prompt is easy to miss, and a prompt that times out used to look exactly
+  # like "nothing to upgrade". Asking first also keeps the timestamp alive for
+  # the whole run instead of re-prompting between worlds.
+  local needs_auth=0
+  if (( ! DRY_RUN )); then
+    if has_fedora && ! sudo -n true >/dev/null 2>&1; then needs_auth=1; fi
+    if has_apt && ! in_ubuntu sudo -n true >/dev/null 2>&1; then needs_auth=1; fi
+  fi
+  if (( needs_auth )); then
+    msg ""
+    msg "  ┌──────────────────────────────────────────────────────────┐"
+    msg "  │  AUTHENTICATE NOW — fingerprint or sudo password.        │"
+    msg "  │  Nothing is upgraded until authentication succeeds.      │"
+    msg "  └──────────────────────────────────────────────────────────┘"
+    msg ""
+    if ! sudo -v; then
+      err "authentication failed — nothing was upgraded"
+      msg ""
+      msg "pkg upgrade needs sudo to change system packages."
+      msg "Authenticate (fingerprint or password) when the prompt appears, then retry."
+      return 1
+    fi
+    # keep the sudo timestamp fresh while a long transaction runs
+    ( while sleep 30; do sudo -n -v >/dev/null 2>&1 || exit 0; done ) >/dev/null 2>&1 &
+    _PKG_KEEPALIVE=$!
+    trap 'kill "${_PKG_KEEPALIVE:-}" 2>/dev/null' EXIT
+  fi
+
   if has_fedora; then
-    info "updating Fedora (dnf)"
-    run sudo dnf upgrade --refresh -y || rc=1
+    info "upgrading Fedora (dnf)"
+    if run sudo dnf upgrade --refresh -y; then dnf_state=ok; else dnf_state=FAILED; rc=1; fi
   else
     info "skipping Fedora (dnf) — not available here"
   fi
   if has_arch; then
-    info "updating Arch container (yay)"
-    run yay -Syu --noconfirm || rc=1
+    info "upgrading Arch container (yay)"
+    if run yay -Syu --noconfirm; then arch_state=ok; else arch_state=FAILED; rc=1; fi
   else
     info "skipping Arch (yay) — not available here"
   fi
   if has_apt; then
-    info "updating Ubuntu container (apt)"
-    run in_ubuntu sudo apt-get update || rc=1
-    run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || rc=1
+    info "upgrading Ubuntu container (apt)"
+    if run in_ubuntu sudo apt-get update &&
+       run in_ubuntu sudo env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
+      ubuntu_state=ok
+    else
+      ubuntu_state=FAILED; rc=1
+    fi
   else
     info "skipping Ubuntu (apt) — not available here"
   fi
@@ -1197,8 +1299,18 @@ cmd_upgrade() {
   if [[ -n $HERE ]]; then
     info "skipping Flatpaks — host-side only"
   elif command -v flatpak >/dev/null 2>&1; then
-    info "updating Flatpaks"
-    run flatpak update -y || rc=1
+    info "upgrading Flatpaks"
+    if run flatpak update -y; then flatpak_state=ok; else flatpak_state=FAILED; rc=1; fi
+  fi
+
+  msg ""
+  if (( rc == 0 )); then
+    msg "upgraded: dnf=$dnf_state arch=$arch_state ubuntu=$ubuntu_state flatpak=$flatpak_state"
+  else
+    msg "FAILED:   dnf=$dnf_state arch=$arch_state ubuntu=$ubuntu_state flatpak=$flatpak_state"
+    msg ""
+    msg "Some worlds failed (see the output above). If you saw a sudo, fingerprint"
+    msg "or lock error, authenticate and run 'pkg upgrade' again."
   fi
   return $rc
 }

@@ -47,7 +47,13 @@ are accumulated into a nonzero final status. Integration checks:
 
 ## Update/upgrade separation
 
-`cmd_upgrade` retains the original sequential mutating operations. `cmd_update`
+`cmd_upgrade` authenticates **once, up front**: a visible banner, then `sudo -v`,
+then a keepalive loop refreshing the timestamp during long transactions, and a
+per-source summary (`upgraded: dnf=ok …` / `FAILED: dnf=FAILED …`). Without this a
+widget-launched terminal sat on a fingerprint prompt that timed out; the run then
+continued through the other sources printing "Nothing to do", which reads exactly
+like "there is nothing to upgrade". The bridge tees the attempt to
+`~/.cache/pkg/upgrade.log`. It retains the original sequential mutating operations. `cmd_update`
 only refreshes metadata and queries candidates, one background job per reachable
 world, each with separate stdout/stderr files and a checked exit status:
 
@@ -65,11 +71,22 @@ world, each with separate stdout/stderr files and a checked exit status:
   including runtimes and branches, not just apps.
 
 Modes: default grouped list, `--count` total, `--counts` four space-separated
-numbers in DNF/Arch/Ubuntu/Flatpak order, or `--json` one object with `checked_at`
-(epoch seconds), `ok`, `total` (known subtotal if failed), `counts`, `status`.
-Unavailable worlds have zero count and `unavailable` status; failed worlds have
-null count and `error`. Any failure exits 1 and suppresses numeric output rather
-than inventing zeros. Candidate counts are not final solver transaction sizes.
+numbers in DNF/Arch/Ubuntu/Flatpak order (`?` where a source could not be
+queried), or `--json` with `checked_at`, `ok`, `degraded`, `total`, `counts`,
+`status`, `problems`. Semantics: `ok` = every attempted source was checked;
+`degraded` = usable numbers exist but at least one source failed; `alarm` (added
+by the bridge) = neither, i.e. nothing could be checked at all. Unavailable
+sources are 0/`unavailable`, failed ones `null`/`error`, and a failed metadata
+refresh falls back to the cache as `stale`. Every mode exits 1 unless `ok`, so
+scripts stay strict while the panel stays calm. Candidate counts are not final
+solver transaction sizes.
+
+Each source runs under `timeout` (`PKG_CHECK_TIMEOUT_{DNF,ARCH,APT,FLATPAK}` =
+180/300/180/90 s) and the container's `apt-get update` runs at most every
+`PKG_APT_CHECK_HOURS` (6) hours. Refreshing apt on every check once held
+`/var/lib/apt/lists/lock` for minutes while a mirror was mid-sync (404s and a
+size mismatch), which turned every check into an error and every upgrade into a
+lock wait.
 
 The optional `bin/pkg-updates` Python bridge persists atomic JSON under
 `~/.cache/pkg/updates.json`, serializes concurrent checks/upgrades with flock,

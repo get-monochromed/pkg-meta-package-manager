@@ -33,6 +33,57 @@ class WidgetTests(unittest.TestCase):
             self.assertEqual(command[:3], ['konsole', '--hold', '-e'])
             self.assertEqual(command[-1], 'upgrade')
 
+    def test_alarm_only_when_nothing_could_be_checked(self):
+        """A single broken mirror degrades the check; it must not raise the alarm."""
+        cases = [
+            (dict(ok=True, degraded=False, total=26, counts=dict(dnf=26, arch=0, ubuntu=0, flatpak=0),
+                  status=dict(dnf='ok', arch='ok', ubuntu='ok', flatpak='ok'), problems={}), False),
+            (dict(ok=False, degraded=True, total=26, counts=dict(dnf=26, arch=0, ubuntu=None, flatpak=0),
+                  status=dict(dnf='ok', arch='ok', ubuntu='error', flatpak='ok'),
+                  problems={'ubuntu': '404 Not Found'}), False),
+            (dict(ok=False, degraded=False, total=0, counts=dict(dnf=None, arch=None, ubuntu=None, flatpak=None),
+                  status=dict(dnf='error', arch='error', ubuntu='error', flatpak='error'),
+                  problems={'dnf': 'offline'}), True),
+        ]
+        for payload, expected_alarm in cases:
+            with self.subTest(payload=payload['status']):
+                with tempfile.TemporaryDirectory() as d:
+                    d = Path(d)
+                    pkg = d / 'pkg'
+                    pkg.write_text('#!/bin/sh\ncat <<"EOF"\n' + json.dumps(payload) + '\nEOF\n')
+                    pkg.chmod(0o755)
+                    state = d / 'state.json'
+                    env = dict(os.environ, PKG_UPDATES_PKG=str(pkg))
+                    p = subprocess.run([str(HELPER), '--state-file', str(state), 'check',
+                                        '--no-notify'], env=env, capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 0 if payload['ok'] else 1)
+                    data = json.loads(state.read_text())
+                    self.assertEqual(data['alarm'], expected_alarm)
+                    self.assertEqual(data['problems'], payload['problems'])
+
+    def test_upgrade_logs_the_attempt(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            pkg = d / 'pkg'
+            pkg.write_text("""#!/bin/sh
+if [ "$1" = upgrade ]; then
+  echo "==> upgrading Fedora (dnf)"
+  echo "sudo: a password is required" >&2
+  exit 1
+fi
+echo '{"ok":true,"total":0,"counts":{"dnf":0,"arch":0,"ubuntu":0,"flatpak":0},"status":{"dnf":"ok","arch":"ok","ubuntu":"ok","flatpak":"ok"},"problems":{}}'
+""")
+            pkg.chmod(0o755)
+            env = dict(os.environ, PKG_UPDATES_PKG=str(pkg))
+            p = subprocess.run([str(HELPER), '--state-file', str(d / 'state.json'), 'upgrade'],
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn('==> upgrading Fedora (dnf)', p.stdout)
+            self.assertIn('sudo: a password is required', p.stdout)  # merged, so visible
+            log = (Path.home() / '.cache/pkg/upgrade.log').read_text()
+            self.assertIn('=== pkg upgrade', log)
+            self.assertIn('pkg upgrade failed with status 1', p.stderr)
+
     def test_invalid_backend_output_is_an_error_not_zero(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -143,6 +194,42 @@ pathlib.Path(__file__).with_name('notification.json').write_text(json.dumps(sys.
             self.assertIn('14 package updates available', args)
             for text in ('DNF: 5', 'Arch/AUR: 3', 'Ubuntu: 2', 'Flatpak: 4'):
                 self.assertIn(text, args[-1])
+
+    def test_degraded_check_still_notifies_about_real_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            pkg = d / 'pkg'
+            pkg.write_text("""#!/bin/sh
+echo '{"ok":false,"degraded":true,"total":26,"counts":{"dnf":26,"arch":0,"ubuntu":null,"flatpak":0},"status":{"dnf":"ok","arch":"ok","ubuntu":"error","flatpak":"ok"},"problems":{"ubuntu":"404"}}'
+""")
+            notify = d / 'notify-send'
+            notify.write_text('#!/usr/bin/python3\nimport json,pathlib,sys\n'
+                              'pathlib.Path(__file__).with_name("n.json").write_text(json.dumps(sys.argv[1:]))\n')
+            pkg.chmod(0o755)
+            notify.chmod(0o755)
+            env = dict(os.environ, PKG_UPDATES_PKG=str(pkg), PATH=f'{d}:/usr/bin:/bin')
+            p = subprocess.run([str(HELPER), '--state-file', str(d / 'state.json'), 'check'],
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 1)  # an incomplete check still exits 1
+            args = json.loads((d / 'n.json').read_text())
+            self.assertIn('26 package updates available', args)
+            self.assertIn('Ubuntu: ?', args[-1])
+
+    def test_total_failure_does_not_notify(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            pkg = d / 'pkg'
+            pkg.write_text("""#!/bin/sh
+echo '{"ok":false,"degraded":false,"total":0,"counts":{"dnf":null,"arch":null,"ubuntu":null,"flatpak":null},"status":{"dnf":"error","arch":"error","ubuntu":"error","flatpak":"error"},"problems":{"dnf":"offline"}}'
+""")
+            notify = d / 'notify-send'
+            notify.write_text('#!/bin/sh\ntouch "' + str(d / 'notified') + '"\n')
+            pkg.chmod(0o755)
+            notify.chmod(0o755)
+            env = dict(os.environ, PKG_UPDATES_PKG=str(pkg), PATH=f'{d}:/usr/bin:/bin')
+            subprocess.run([str(HELPER), '--state-file', str(d / 'state.json'), 'check'],
+                           env=env, capture_output=True, text=True)
+            self.assertFalse((d / 'notified').exists())
 
     def test_schedule_keeps_startup_check_after_interval_reset(self):
         with tempfile.TemporaryDirectory() as d:

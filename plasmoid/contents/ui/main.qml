@@ -17,7 +17,10 @@ PlasmoidItem {
     readonly property var labels: ["DNF", "Arch / AUR", "Ubuntu", "Flatpak"]
     readonly property string helper: '"$HOME/.local/bin/pkg-updates"'
     readonly property string readCommand: helper + " state"
-    readonly property bool hasErrors: worlds.some(w => payload.status[w] === "error") || !!payload.error
+    // Only shout when NOTHING could be checked. One mirror being mid-sync shows
+    // as "?" for that source instead of an alarm on the whole widget.
+    readonly property bool alarmed: payload.alarm === true
+    readonly property var problems: payload.problems || ({})
     readonly property int itemWidth: Kirigami.Units.iconSizes.smallMedium + metrics.advanceWidth + 16
 
     function countText(world) {
@@ -26,10 +29,19 @@ PlasmoidItem {
         return n === null || n === undefined ? "?" : String(n);
     }
     function tooltip() {
-        let text = worlds.map((w, i) => labels[i] + ": " + countText(w)).join(" · ");
+        let text = worlds.map((w, i) => {
+            let line = labels[i] + ": " + countText(w);
+            if (payload.status[w] === "stale") line += " (stale)";
+            return line;
+        }).join(" · ");
         if (payload.checked_at) text += "\nChecked: " + new Date(payload.checked_at * 1000).toLocaleString();
         else text += "\nNot checked yet";
-        if (hasErrors) text += "\nCheck failed — right-click to retry. Run pkg update for details.";
+        const bad = worlds.filter(w => problems[w]);
+        if (bad.length) {
+            text += "\nCould not check: " + bad.map(w =>
+                labels[worlds.indexOf(w)] + " — " + String(problems[w]).trim().split("\n")[0]).join("; ");
+        }
+        if (alarmed) text += "\nNothing could be checked — right-click to retry.";
         return text + "\nClick to upgrade all · Right-click to check now or change the interval";
     }
     function upgrade() { executor.connectSource(helper + " launch"); }
@@ -94,14 +106,14 @@ PlasmoidItem {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Kirigami.Units.iconSizes.smallMedium
                 height: width
-                source: root.hasErrors ? "dialog-warning" : "system-software-update"
-                opacity: root.payload.total > 0 || root.hasErrors ? 1 : 0.5
+                source: root.alarmed ? "dialog-warning" : "system-software-update"
+                opacity: root.payload.total > 0 || root.alarmed ? 1 : 0.5
             }
             PlasmaComponents.Label {
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.worlds.map(w => root.countText(w)).join("  ")
                 font: Kirigami.Theme.smallFont
-                opacity: root.payload.total > 0 || root.hasErrors ? 1 : 0.5
+                opacity: root.payload.total > 0 || root.alarmed ? 1 : 0.5
             }
         }
         MouseArea {
