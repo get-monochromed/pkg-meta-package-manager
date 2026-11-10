@@ -111,6 +111,12 @@ nothing is installed on the host. Both recipes are in `docs/how-it-works.md`
   "File has unexpected size") made each check take minutes, held
   `/var/lib/apt/lists/lock`, and turned the whole check into an error. Gate the
   refresh on index age and fall back to the cache with a `stale` status.
+- **Buffer a source's output; never let a failed attempt print.** `out=$(cmd)` and
+  print only on success: a query killed mid-refresh leaves a truncated last line
+  that would be counted as a phantom update.
+- **Escape `problems` (strip `\000-\037`) before JSON.** Mirror error text carries
+  CR/TAB and one control character invalidates the document, which the widget then
+  reports as a total failure — the exact false alarm this code exists to avoid.
 - **A single failing source is degradation, not failure.** Only "nothing could be
   checked" may raise the widget's alarm; otherwise one dead mirror hides 26 real
   updates behind a warning triangle (and suppresses the notification).
