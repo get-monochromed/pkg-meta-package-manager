@@ -56,6 +56,7 @@ def save_state(path, data):
 
 def check(path, notify=True, wait=False):
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous = read_state(path).get('counts', {})
     with path.with_suffix('.lock').open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
@@ -76,11 +77,14 @@ def check(path, notify=True, wait=False):
             data = initial() | dict(checked_at=int(time.time()), error=str(exc))
             classify(data)
         save_state(path, data)
-        # Notify when there are usable counts, even if one source is degraded:
-        # 26 DNF updates still matter while Ubuntu's mirror is down.
-        if notify and not data['alarm'] and data['total'] > 0:
+        changed = {w: data['counts'][w] for w in WORLDS} != {w: previous.get(w) for w in WORLDS}
+        # Notify when the numbers actually changed: a manual "check now" with the
+        # same counts must not re-announce them. Degraded checks still notify,
+        # because 26 DNF updates matter while Ubuntu's mirror is down.
+        if notify and not data['alarm'] and data['total'] > 0 and changed:
             text = ' · '.join(
                 f'{label}: {data["counts"][w] if data["counts"][w] is not None else "?"}'
+                + (' (stale)' if data['status'].get(w) == 'stale' else '')
                 for w, label in zip(WORLDS, ('DNF', 'Arch/AUR', 'Ubuntu', 'Flatpak')))
             try:
                 subprocess.run(['notify-send', '-a', 'pkg', '-i', 'system-software-update',
@@ -106,7 +110,9 @@ def main():
     p.add_argument('--hours', type=int, choices=(24, 48), required=True)
     args = parser.parse_args()
     if args.command == 'state':
-        print(json.dumps(read_state(args.state_file)))
+        # classify() so a state file written by an older version (no alarm key)
+        # is never rendered as a calm widget while it is actually broken.
+        print(json.dumps(classify(read_state(args.state_file))))
         return 0
     if args.command == 'check':
         return check(args.state_file, not args.no_notify)

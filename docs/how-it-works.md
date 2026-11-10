@@ -53,7 +53,8 @@ per-source summary (`upgraded: dnf=ok …` / `FAILED: dnf=FAILED …`). Without 
 widget-launched terminal sat on a fingerprint prompt that timed out; the run then
 continued through the other sources printing "Nothing to do", which reads exactly
 like "there is nothing to upgrade". The bridge tees the attempt to
-`~/.cache/pkg/upgrade.log`. It retains the original sequential mutating operations. `cmd_update`
+`upgrade.log` next to the state file. Under `-n` it prints `dry-run:` rather than
+claiming it upgraded. It retains the original sequential mutating operations. `cmd_update`
 only refreshes metadata and queries candidates, one background job per reachable
 world, each with separate stdout/stderr files and a checked exit status:
 
@@ -76,8 +77,12 @@ queried), or `--json` with `checked_at`, `ok`, `degraded`, `total`, `counts`,
 `status`, `problems`. Semantics: `ok` = every attempted source was checked;
 `degraded` = usable numbers exist but at least one source failed; `alarm` (added
 by the bridge) = neither, i.e. nothing could be checked at all. Unavailable
-sources are 0/`unavailable`, failed ones `null`/`error`, and a failed metadata
-refresh falls back to the cache as `stale`. Every mode exits 1 unless `ok`, so
+sources are `null`/`unavailable` (unknown, never 0), failed ones `null`/`error`,
+and a failed metadata refresh falls back to the cache as `stale` only when a cache
+actually exists (`PKG_APT_LISTS_DIR` overrides the probed index directory for
+tests); with no index at all it is an error. `problems` values are stripped of
+control characters — mirror output is untrusted and a stray CR used to make the
+whole JSON document unparseable, which the bridge then turned into a false alarm. Every mode exits 1 unless `ok`, so
 scripts stay strict while the panel stays calm. Candidate counts are not final
 solver transaction sizes.
 

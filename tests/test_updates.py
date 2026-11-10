@@ -1,6 +1,7 @@
 """CLI contract tests with deterministic package-manager executables, no installs."""
 import json
 import os
+import time
 from pathlib import Path
 import subprocess
 import tempfile
@@ -39,6 +40,14 @@ if name == 'sudo':
 if name == 'dnf':
     if os.environ.get('FAIL_DNF'):
         print('repository unavailable', file=sys.stderr)
+        sys.exit(1)
+    if os.environ.get('FAIL_DNF_REFRESH') and '--refresh' in args:
+        # dies mid-output: the truncated line must never be counted
+        sys.stdout.write('alpha.x86_64 2-1\npar')
+        print('\r  cache expired\terror  \t', file=sys.stderr)
+        sys.exit(1)
+    if os.environ.get('FAIL_DNF_BOTH') and 'repoquery' in args:
+        sys.stdout.write('alpha.x86_64 2-1\npar')
         sys.exit(1)
     if 'repoquery' in args:
         print('alpha.x86_64 2-1\nalpha.x86_64 2-1\nbeta.noarch 3-1')
@@ -107,6 +116,16 @@ class UpdateTests(unittest.TestCase):
                         PKG_TEST_LOG=str(self.dir / 'calls'), CONTAINER_ID='',
                         SUDO_CACHED='1')  # inside the containers sudo is passwordless
 
+    def apt_lists(self, hours_old=48):
+        """Point the container's index probe at a fixture (the real one is read-only)."""
+        d = self.dir / 'apt-lists'
+        d.mkdir(exist_ok=True)
+        f = d / 'resolute-updates_Packages'
+        f.write_text('x')
+        stamp = time.time() - hours_old * 3600
+        os.utime(f, (stamp, stamp))
+        return d
+
     def run_pkg(self, *args, **env):
         return subprocess.run([str(ROOT / 'bin/pkg'), *args],
                               env=self.env | env, text=True, capture_output=True,
@@ -167,7 +186,8 @@ class UpdateTests(unittest.TestCase):
         p = self.run_pkg('update', '--json', CONTAINER_ID='Ubuntu')
         data = json.loads(p.stdout)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(data['counts'], dict(dnf=0, arch=0, ubuntu=1, flatpak=0))
+        # unreachable sources are unknown, not zero
+        self.assertEqual(data['counts'], dict(dnf=None, arch=None, ubuntu=1, flatpak=None))
         self.assertEqual(data['status']['flatpak'], 'unavailable')
 
     def test_human_output_and_option_errors(self):
@@ -205,12 +225,60 @@ class UpdateTests(unittest.TestCase):
                                               ubuntu='error', flatpak='error'))
 
     def test_apt_refresh_failure_falls_back_to_the_cached_index(self):
-        p = self.run_pkg('update', '--json', FAIL_APT_UPDATE='1')
+        lists = self.apt_lists(hours_old=48)
+        p = self.run_pkg('update', '--json', FAIL_APT_UPDATE='1',
+                         PKG_APT_LISTS_DIR=str(lists))
         data = json.loads(p.stdout)
         self.assertEqual(p.returncode, 1)
         self.assertEqual(data['status']['ubuntu'], 'stale')
         self.assertEqual(data['counts']['ubuntu'], 1)  # counted from the last index
         self.assertIn('ubuntu', data['problems'])
+
+    def test_apt_with_no_index_at_all_is_an_error_not_a_stale_zero(self):
+        empty = self.dir / 'no-apt-lists'
+        empty.mkdir()
+        p = self.run_pkg('update', '--json', FAIL_APT_UPDATE='1',
+                         PKG_APT_LISTS_DIR=str(empty))
+        data = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(data['status']['ubuntu'], 'error')   # not 'stale'
+        self.assertIsNone(data['counts']['ubuntu'])           # `?`, never 0
+        counts = self.run_pkg('update', '--counts', FAIL_APT_UPDATE='1',
+                              PKG_APT_LISTS_DIR=str(empty))
+        self.assertEqual(counts.stdout.split()[2], '?')
+
+    def test_dnf_stale_fallback_counts_only_real_cache_output(self):
+        """A refresh that dies mid-line must not contribute a phantom update."""
+        p = self.run_pkg('update', '--json', FAIL_DNF_REFRESH='1')
+        data = json.loads(p.stdout)
+        self.assertEqual(data['status']['dnf'], 'stale')
+        self.assertEqual(data['counts']['dnf'], 2)  # alpha + beta, not the 'par' fragment
+
+    def test_dnf_with_no_usable_cache_is_an_error(self):
+        p = self.run_pkg('update', '--json', FAIL_DNF_BOTH='1')
+        data = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(data['status']['dnf'], 'error')
+        self.assertIsNone(data['counts']['dnf'])
+
+    def test_control_characters_in_error_text_stay_valid_json(self):
+        p = self.run_pkg('update', '--json', FAIL_DNF_REFRESH='1')
+        data = json.loads(p.stdout)  # would raise on an unescaped control char
+        self.assertIn('dnf', data['problems'])
+
+    def test_no_reachable_world_is_a_failure_not_zero_updates(self):
+        minimal = self.dir / 'minbin'
+        minimal.mkdir()
+        for exe in ('bash', 'readlink', 'mktemp', 'date', 'awk', 'grep', 'rm', 'sed', 'tr', 'head'):
+            (minimal / exe).symlink_to(f'/usr/bin/{exe}')
+        p = self.run_pkg('update', '--json', PATH=str(minimal))
+        data = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 1)
+        self.assertFalse(data['ok'])
+        self.assertFalse(data['degraded'])
+        self.assertEqual(set(data['counts'].values()), {None})
+        count = self.run_pkg('update', '--count', PATH=str(minimal))
+        self.assertEqual(count.returncode, 1)
 
     def test_numeric_modes_report_unknown_worlds_without_lying(self):
         p = self.run_pkg('update', '--counts', FAIL_FLATPAK='1')

@@ -178,9 +178,10 @@ last check time. Unknown/failed counts show `?`; unavailable sources show `–`.
   per-source summary — `upgraded: dnf=ok arch=ok …` or `FAILED: dnf=FAILED …`.
 - **Middle-click / right-click → Check for updates now:** fresh background check.
 - **Right-click → Check every day / every two days:** choose 24 or 48 hours.
-- A scheduled check with updates posts a desktop notification, including when one
-  source is degraded (it shows that source as `?`). The warning icon appears only
-  when *nothing* could be checked.
+- A check posts a desktop notification **only when the counts changed**, so a
+  manual "check now" with the same numbers stays quiet. Degraded checks still
+  notify (the broken source shows as `?`, a cache-only source as `(stale)`). The
+  warning icon appears only when *nothing* could be checked.
 - The panel only polls cached JSON every 15 seconds; it does not run package
   managers every 15 seconds. A systemd **user timer** checks daily by default,
   and 10 minutes after the user manager starts (typically login). Missed running

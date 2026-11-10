@@ -231,6 +231,41 @@ echo '{"ok":false,"degraded":false,"total":0,"counts":{"dnf":null,"arch":null,"u
                            env=env, capture_output=True, text=True)
             self.assertFalse((d / 'notified').exists())
 
+    def test_legacy_state_file_is_classified_not_rendered_calm(self):
+        """A state written before alarm/degraded existed must not look healthy."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            state = d / 'state.json'
+            state.write_text(json.dumps(dict(ok=False, checked_at=1, total=0,
+                counts=dict(dnf=None, arch=None, ubuntu=None, flatpak=None),
+                status=dict(dnf='error', arch='error', ubuntu='error', flatpak='error'))))
+            p = subprocess.run([str(HELPER), '--state-file', str(state), 'state'],
+                               capture_output=True, text=True)
+            self.assertTrue(json.loads(p.stdout)['alarm'])
+            state.write_text(json.dumps(dict(ok=True, checked_at=1, total=3,
+                counts=dict(dnf=3, arch=0, ubuntu=0, flatpak=0),
+                status=dict(dnf='ok', arch='ok', ubuntu='ok', flatpak='ok'))))
+            p = subprocess.run([str(HELPER), '--state-file', str(state), 'state'],
+                               capture_output=True, text=True)
+            self.assertFalse(json.loads(p.stdout)['alarm'])
+
+    def test_identical_counts_do_not_notify_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            pkg = d / 'pkg'
+            pkg.write_text("""#!/bin/sh
+echo '{"ok":true,"total":5,"counts":{"dnf":5,"arch":0,"ubuntu":0,"flatpak":0},"status":{"dnf":"ok","arch":"ok","ubuntu":"ok","flatpak":"ok"},"problems":{}}'
+""")
+            notify = d / 'notify-send'
+            notify.write_text('#!/bin/sh\necho notified >> "' + str(d / 'sent') + '"\n')
+            pkg.chmod(0o755)
+            notify.chmod(0o755)
+            env = dict(os.environ, PKG_UPDATES_PKG=str(pkg), PATH=f'{d}:/usr/bin:/bin')
+            args = [str(HELPER), '--state-file', str(d / 'state.json'), 'check']
+            subprocess.run(args, env=env, capture_output=True, text=True)
+            subprocess.run(args, env=env, capture_output=True, text=True)
+            self.assertEqual((d / 'sent').read_text().count('notified'), 1)
+
     def test_schedule_keeps_startup_check_after_interval_reset(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

@@ -42,6 +42,7 @@ PlasmoidItem {
                 labels[worlds.indexOf(w)] + " — " + String(problems[w]).trim().split("\n")[0]).join("; ");
         }
         if (alarmed) text += "\nNothing could be checked — right-click to retry.";
+        if (payload.error) text += "\nError: " + String(payload.error).split("\n")[0];
         return text + "\nClick to upgrade all · Right-click to check now or change the interval";
     }
     function upgrade() { executor.connectSource(helper + " launch"); }
